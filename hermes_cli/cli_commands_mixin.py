@@ -1547,14 +1547,30 @@ class CLICommandsMixin:
         the active session's conversation history.
         """
         from cli import AIAgent, ChatConsole, _accent_hex, _cprint, _maybe_remap_for_light_mode, _render_final_assistant_content, set_approval_callback, set_secret_capture_callback, set_sudo_password_callback
+        from agent.background_registry import background_tasks
+
         parts = cmd.strip().split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
+        args = parts[1].strip() if len(parts) > 1 else ""
+        sub = args.split(maxsplit=1)
+        verb = sub[0].lower() if sub else ""
+
+        # Subcommands: /background list, /background cancel <id>.
+        if verb in ("list", "ls", "ps"):
+            self._background_list_tasks()
+            return
+        if verb in ("cancel", "kill", "stop"):
+            self._background_cancel_task(sub[1].strip() if len(sub) > 1 else "")
+            return
+
+        if not args:
             _cprint("  Usage: /background <prompt>")
+            _cprint("         /background list")
+            _cprint("         /background cancel <id|#n>")
             _cprint("  Example: /background Summarize the top HN stories today")
             _cprint("  The task runs in a separate session and results display here when done.")
             return
 
-        prompt = parts[1].strip()
+        prompt = args
         self._background_task_counter += 1
         task_num = self._background_task_counter
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -1606,6 +1622,9 @@ class CLICommandsMixin:
                     openrouter_min_coding_score=self._openrouter_min_coding_score,
                     fallback_model=self._fallback_model,
                 )
+                # Register the live agent so `/background cancel <id>` can reach
+                # it. Unregistered in the finally below when the task settles.
+                background_tasks.register(task_id, bg_agent, prompt=prompt, surface="cli")
                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
                 bg_agent._print_fn = lambda *_a, **_kw: None
 
@@ -1634,8 +1653,12 @@ class CLICommandsMixin:
                     self._app.invalidate()
                     time.sleep(0.05)  # brief pause for refresh
                 print()
+                _was_cancelled = bool(result and result.get("interrupted"))
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
-                _cprint(f"  ✅ Background task #{task_num} complete")
+                if _was_cancelled:
+                    _cprint(f"  🛑 Background task #{task_num} cancelled")
+                else:
+                    _cprint(f"  ✅ Background task #{task_num} complete")
                 _cprint(f"  Prompt: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
                 if response:
@@ -1684,6 +1707,7 @@ class CLICommandsMixin:
                 except Exception:
                     pass
                 self._background_tasks.pop(task_id, None)
+                background_tasks.unregister(task_id)
                 # Clear spinner only if no foreground agent owns it
                 if not self._agent_running:
                     self._spinner_text = ""
@@ -1693,6 +1717,44 @@ class CLICommandsMixin:
         thread = threading.Thread(target=run_background, daemon=True, name=f"bg-task-{task_id}")
         self._background_tasks[task_id] = thread
         thread.start()
+
+    def _background_list_tasks(self) -> None:
+        """Render running background tasks for ``/background list``."""
+        from cli import _cprint
+        from agent.background_registry import background_tasks
+
+        records = background_tasks.list(surface="cli")
+        if not records:
+            _cprint("  No background tasks running.")
+            return
+        _cprint(f"  Background tasks ({len(records)}):")
+        for i, rec in enumerate(records, start=1):
+            status = " (cancelling)" if rec.cancel_requested else ""
+            _cprint(
+                f"    #{i}  {rec.task_id}  {int(rec.age_seconds)}s{status}  \"{rec.preview()}\""
+            )
+        _cprint("  Cancel with: /background cancel <id|#n>")
+
+    def _background_cancel_task(self, token: str) -> None:
+        """Cancel one background task for ``/background cancel <id|#n>``."""
+        from cli import _cprint
+        from agent.background_registry import background_tasks, AmbiguousTaskError
+
+        if not token:
+            _cprint("  Usage: /background cancel <id|#n>   (see /background list)")
+            return
+        try:
+            rec = background_tasks.cancel(token, surface="cli")
+        except AmbiguousTaskError as exc:
+            _cprint(f"  Ambiguous: {token!r} matches {', '.join(exc.matches)}.")
+            return
+        if rec is None:
+            _cprint(f"  No running background task matches {token!r}. Try /background list.")
+            return
+        _cprint(
+            f"  🛑 Cancelling {rec.task_id} (\"{rec.preview()}\") — "
+            "it will stop within a few seconds."
+        )
 
     def _handle_bundles_command(self, cmd: str) -> None:
         """In-session ``/bundles`` — show installed skill bundles.

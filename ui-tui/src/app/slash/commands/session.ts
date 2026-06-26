@@ -1,6 +1,8 @@
 import { attachedImageNotice, introMsg, toTranscriptMessages } from '../../../domain/messages.js'
 import { TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
 import type {
+  BackgroundCancelResponse,
+  BackgroundListResponse,
   BackgroundStartResponse,
   ConfigGetValueResponse,
   ConfigSetResponse,
@@ -41,11 +43,53 @@ const modelValueForConfigSet = (arg: string) => {
 export const sessionCommands: SlashCommand[] = [
   {
     aliases: ['bg', 'btw'],
-    help: 'launch a background prompt',
+    help: 'launch a background prompt (list | cancel <id>)',
     name: 'background',
     run: (arg, ctx) => {
-      if (!arg) {
-        return ctx.transcript.sys('/background <prompt>')
+      const trimmed = arg.trim()
+      const [verb, ...rest] = trimmed.split(/\s+/)
+      const lowerVerb = verb?.toLowerCase()
+
+      // /background list — show running background tasks.
+      if (lowerVerb === 'list' || lowerVerb === 'ls' || lowerVerb === 'ps') {
+        ctx.gateway.rpc<BackgroundListResponse>('prompt.background.list', { session_id: ctx.sid }).then(
+          ctx.guarded<BackgroundListResponse>(r => {
+            const tasks = r.tasks ?? []
+            if (tasks.length === 0) {
+              return ctx.transcript.sys('no background tasks running')
+            }
+            ctx.transcript.sys(`background tasks (${tasks.length}):`)
+            tasks.forEach((task, i) => {
+              const status = task.cancel_requested ? ' (cancelling)' : ''
+              ctx.transcript.sys(`  #${i + 1} ${task.task_id} ${task.age_seconds ?? 0}s${status} "${task.prompt ?? ''}"`)
+            })
+          })
+        )
+        return
+      }
+
+      // /background cancel <id|#n> — stop a running background task.
+      if (lowerVerb === 'cancel' || lowerVerb === 'kill' || lowerVerb === 'stop') {
+        const token = rest.join(' ').trim()
+        if (!token) {
+          return ctx.transcript.sys('/background cancel <id|#n>  (see /background list)')
+        }
+        ctx.gateway.rpc<BackgroundCancelResponse>('prompt.background.cancel', { session_id: ctx.sid, task_id: token }).then(
+          ctx.guarded<BackgroundCancelResponse>(r => {
+            if (r.cancelled) {
+              ctx.transcript.sys(`🛑 cancelling ${r.task_id} ("${r.prompt ?? ''}") — stopping shortly`)
+            } else if (r.reason === 'ambiguous') {
+              ctx.transcript.sys(`ambiguous: ${token} matches ${(r.matches ?? []).join(', ')}`)
+            } else {
+              ctx.transcript.sys(`no background task matches ${token} (see /background list)`)
+            }
+          })
+        )
+        return
+      }
+
+      if (!trimmed) {
+        return ctx.transcript.sys('/background <prompt> | list | cancel <id>')
       }
 
       ctx.gateway.rpc<BackgroundStartResponse>('prompt.background', { session_id: ctx.sid, text: arg }).then(

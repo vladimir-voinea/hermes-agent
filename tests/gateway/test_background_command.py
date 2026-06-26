@@ -185,6 +185,107 @@ class TestHandleBackgroundCommand:
                 assert "Background task started" in result
 
 
+class _FakeAgent:
+    def __init__(self):
+        self.interrupt_message = None
+
+    def interrupt(self, message=None):
+        self.interrupt_message = message
+
+
+class TestBackgroundCancelAndList:
+    """Tests for the /background list and /background cancel subcommands."""
+
+    def setup_method(self):
+        from agent.background_registry import background_tasks
+        # Start each test from a clean registry.
+        for rec in background_tasks.list():
+            background_tasks.unregister(rec.task_id)
+
+    def teardown_method(self):
+        from agent.background_registry import background_tasks
+        for rec in background_tasks.list():
+            background_tasks.unregister(rec.task_id)
+
+    @pytest.mark.asyncio
+    async def test_list_empty(self):
+        runner = _make_runner()
+        result = await runner._handle_background_command(_make_event(text="/background list"))
+        assert "No background tasks running" in result
+
+    @pytest.mark.asyncio
+    async def test_list_shows_running_tasks(self):
+        from agent.background_registry import background_tasks
+        background_tasks.register("bg_111111_aaaaaa", _FakeAgent(), prompt="first job", surface="gateway")
+        background_tasks.register("bg_222222_bbbbbb", _FakeAgent(), prompt="second job", surface="gateway")
+
+        runner = _make_runner()
+        result = await runner._handle_background_command(_make_event(text="/background list"))
+        assert "bg_111111_aaaaaa" in result
+        assert "bg_222222_bbbbbb" in result
+        assert "first job" in result
+
+    @pytest.mark.asyncio
+    async def test_cancel_interrupts_agent(self):
+        from agent.background_registry import background_tasks
+        agent = _FakeAgent()
+        background_tasks.register("bg_333333_cccccc", agent, prompt="cancel me", surface="gateway")
+
+        runner = _make_runner()
+        result = await runner._handle_background_command(
+            _make_event(text="/background cancel bg_333333_cccccc")
+        )
+        assert "Cancelling" in result
+        assert "bg_333333_cccccc" in result
+        assert agent.interrupt_message is not None
+
+    @pytest.mark.asyncio
+    async def test_cancel_by_index(self):
+        from agent.background_registry import background_tasks
+        agent = _FakeAgent()
+        background_tasks.register("bg_444444_dddddd", agent, prompt="indexed", surface="gateway")
+
+        runner = _make_runner()
+        result = await runner._handle_background_command(_make_event(text="/background cancel #1"))
+        assert "bg_444444_dddddd" in result
+        assert agent.interrupt_message is not None
+
+    @pytest.mark.asyncio
+    async def test_cancel_unknown_id(self):
+        runner = _make_runner()
+        result = await runner._handle_background_command(
+            _make_event(text="/background cancel bg_nope")
+        )
+        assert "No running background task" in result
+
+    @pytest.mark.asyncio
+    async def test_cancel_without_id_shows_usage(self):
+        runner = _make_runner()
+        result = await runner._handle_background_command(_make_event(text="/background cancel"))
+        assert "Usage" in result
+
+    @pytest.mark.asyncio
+    async def test_cancel_ambiguous_prefix(self):
+        from agent.background_registry import background_tasks
+        background_tasks.register("bg_555555_eeeeee", _FakeAgent(), surface="gateway")
+        background_tasks.register("bg_555555_ffffff", _FakeAgent(), surface="gateway")
+
+        runner = _make_runner()
+        result = await runner._handle_background_command(
+            _make_event(text="/background cancel bg_555555")
+        )
+        assert "multiple" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_list_ignores_other_surfaces(self):
+        from agent.background_registry import background_tasks
+        background_tasks.register("bg_cli_0001", _FakeAgent(), prompt="cli task", surface="cli")
+
+        runner = _make_runner()
+        result = await runner._handle_background_command(_make_event(text="/background list"))
+        assert "No background tasks running" in result
+
+
 # ---------------------------------------------------------------------------
 # _run_background_task
 # ---------------------------------------------------------------------------
@@ -266,6 +367,42 @@ class TestRunBackgroundTask:
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_is_labeled_cancelled(self):
+        """An interrupted (cancelled) task is reported as cancelled, not complete."""
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "partial work"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "partial work"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        # run_conversation returns interrupted=True when the agent was cancelled.
+        mock_result = {"final_response": "partial work", "interrupted": True, "messages": []}
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.shutdown_memory_provider = MagicMock()
+            mock_agent_instance.close = MagicMock()
+            mock_agent_instance.run_conversation.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task("do a thing", source, "bg_test")
+
+        mock_adapter.send.assert_called_once()
+        call_args = mock_adapter.send.call_args
+        content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
+        assert "cancelled" in content.lower()
+        assert "Background task complete" not in content
 
     @pytest.mark.asyncio
     async def test_media_files_routed_by_type(self, monkeypatch):

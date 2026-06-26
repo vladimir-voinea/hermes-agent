@@ -786,7 +786,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'background.complete':
         dropBgTask(ev.payload.task_id)
-        sys(`[bg ${ev.payload.task_id}] ${ev.payload.text}`)
+        sys(
+          `[bg ${ev.payload.task_id}${ev.payload.cancelled ? ' cancelled' : ''}] ${ev.payload.text}`
+        )
 
         return
       case 'review.summary': {

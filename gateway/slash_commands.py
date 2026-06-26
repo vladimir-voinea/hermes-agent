@@ -2270,7 +2270,17 @@ class GatewaySlashCommandsMixin:
         When it completes, sends the result back to the same chat without
         modifying the active session's conversation history.
         """
-        prompt = event.get_command_args().strip()
+        args = event.get_command_args().strip()
+        sub = args.split(maxsplit=1)
+        verb = sub[0].lower() if sub else ""
+
+        # Subcommands: /background list, /background cancel <id>.
+        if verb in ("list", "ls", "ps"):
+            return self._background_list_reply()
+        if verb in ("cancel", "kill", "stop"):
+            return self._background_cancel_reply(sub[1].strip() if len(sub) > 1 else "")
+
+        prompt = args
         if not prompt:
             return t("gateway.background.usage")
 
@@ -2299,6 +2309,47 @@ class GatewaySlashCommandsMixin:
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
+
+    def _background_list_reply(self) -> str:
+        """Build the reply for ``/background list``."""
+        from agent.background_registry import background_tasks
+
+        records = background_tasks.list(surface="gateway")
+        if not records:
+            return t("gateway.background.list_empty")
+        lines = [
+            t(
+                "gateway.background.list_item",
+                index=i,
+                task_id=rec.task_id,
+                age=int(rec.age_seconds),
+                preview=rec.preview(),
+            )
+            for i, rec in enumerate(records, start=1)
+        ]
+        return t("gateway.background.list_header", count=len(records)) + "\n" + "\n".join(lines)
+
+    def _background_cancel_reply(self, token: str) -> str:
+        """Build the reply for ``/background cancel <id>``."""
+        from agent.background_registry import background_tasks, AmbiguousTaskError
+
+        if not token:
+            return t("gateway.background.cancel_usage")
+        try:
+            rec = background_tasks.cancel(token, surface="gateway")
+        except AmbiguousTaskError as exc:
+            return t(
+                "gateway.background.cancel_ambiguous",
+                token=token,
+                matches=", ".join(exc.matches),
+            )
+        if rec is None:
+            return t("gateway.background.cancel_not_found", token=token)
+        return t(
+            "gateway.background.cancel_ok",
+            task_id=rec.task_id,
+            preview=rec.preview(),
+        )
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.

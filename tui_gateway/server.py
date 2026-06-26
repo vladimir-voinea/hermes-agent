@@ -9350,18 +9350,24 @@ def _(rid, params: dict) -> dict:
         session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
         try:
             from run_agent import AIAgent
+            from agent.background_registry import background_tasks
 
-            result = AIAgent(
-                **_background_agent_kwargs(session["agent"], task_id)
-            ).run_conversation(
-                user_message=text,
-                task_id=task_id,
-            )
+            bg_agent = AIAgent(**_background_agent_kwargs(session["agent"], task_id))
+            # Register the live agent so prompt.background.cancel can reach it.
+            background_tasks.register(task_id, bg_agent, prompt=text, surface="tui")
+            try:
+                result = bg_agent.run_conversation(
+                    user_message=text,
+                    task_id=task_id,
+                )
+            finally:
+                background_tasks.unregister(task_id)
             _emit(
                 "background.complete",
                 parent,
                 {
                     "task_id": task_id,
+                    "cancelled": bool(result.get("interrupted")) if isinstance(result, dict) else False,
                     "text": (
                         result.get("final_response", str(result))
                         if isinstance(result, dict)
@@ -9380,6 +9386,46 @@ def _(rid, params: dict) -> dict:
 
     threading.Thread(target=run, daemon=True).start()
     return _ok(rid, {"task_id": task_id})
+
+
+@method("prompt.background.list")
+def _(rid, params: dict) -> dict:
+    """List running background tasks (for the TUI's `/background list`)."""
+    from agent.background_registry import background_tasks
+
+    tasks = [
+        {
+            "task_id": rec.task_id,
+            "prompt": rec.preview(),
+            "age_seconds": int(rec.age_seconds),
+            "cancel_requested": rec.cancel_requested,
+        }
+        for rec in background_tasks.list(surface="tui")
+    ]
+    return _ok(rid, {"tasks": tasks})
+
+
+@method("prompt.background.cancel")
+def _(rid, params: dict) -> dict:
+    """Cancel one background task by id / unique prefix / #n.
+
+    Returns ``{cancelled: true, task_id, prompt}`` on success, or
+    ``{cancelled: false, reason}`` (``not_found`` | ``ambiguous``) otherwise.
+    The agent stops cooperatively within a few seconds and emits its usual
+    ``background.complete`` event.
+    """
+    from agent.background_registry import background_tasks, AmbiguousTaskError
+
+    token = str(params.get("task_id") or params.get("token") or "").strip()
+    if not token:
+        return _err(rid, 4012, "task_id required")
+    try:
+        rec = background_tasks.cancel(token, surface="tui")
+    except AmbiguousTaskError as exc:
+        return _ok(rid, {"cancelled": False, "reason": "ambiguous", "matches": exc.matches})
+    if rec is None:
+        return _ok(rid, {"cancelled": False, "reason": "not_found"})
+    return _ok(rid, {"cancelled": True, "task_id": rec.task_id, "prompt": rec.preview()})
 
 
 @method("preview.restart")

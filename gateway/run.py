@@ -11850,12 +11850,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
+                from agent.background_registry import background_tasks
+                # Register the live agent so `/background cancel <id>` can reach
+                # it. run_conversation runs on this executor thread, so the
+                # interrupt (set from the event-loop thread) is correctly
+                # thread-scoped to it.
+                background_tasks.register(task_id, agent, prompt=prompt, surface="gateway")
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
                     )
                 finally:
+                    background_tasks.unregister(task_id)
                     self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
@@ -11863,6 +11870,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
+
+            # A cancelled task comes back interrupted; label it as such.
+            was_cancelled = bool(result and result.get("interrupted"))
+            status_line = (
+                "🛑 Background task cancelled" if was_cancelled
+                else "✅ Background task complete"
+            )
 
             # Extract media files from the response
             if response:
@@ -11872,7 +11886,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 images, text_content = adapter.extract_images(response)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                header = f'{status_line}\nPrompt: "{preview}"\n\n'
 
                 if text_content:
                     await adapter.send(
@@ -11940,7 +11954,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    content=f'{status_line}\nPrompt: "{preview}"\n\n(No response generated)',
                     metadata=_thread_metadata,
                 )
 

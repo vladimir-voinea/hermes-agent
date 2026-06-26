@@ -382,6 +382,25 @@ export interface BackgroundStartResponse {
   task_id?: string
 }
 
+export interface BackgroundTaskInfo {
+  task_id: string
+  prompt?: string
+  age_seconds?: number
+  cancel_requested?: boolean
+}
+
+export interface BackgroundListResponse {
+  tasks?: BackgroundTaskInfo[]
+}
+
+export interface BackgroundCancelResponse {
+  cancelled?: boolean
+  task_id?: string
+  prompt?: string
+  reason?: 'not_found' | 'ambiguous'
+  matches?: string[]
+}
+
 export interface ClarifyRespondResponse {
   ok?: boolean
 }
@@ -691,7 +710,7 @@ export type GatewayEvent =
     }
   | { payload: { request_id: string }; session_id?: string; type: 'sudo.request' }
   | { payload: { env_var: string; prompt: string; request_id: string }; session_id?: string; type: 'secret.request' }
-  | { payload: { task_id: string; text: string }; session_id?: string; type: 'background.complete' }
+  | { payload: { task_id: string; text: string; cancelled?: boolean }; session_id?: string; type: 'background.complete' }
   | { payload?: { text?: string }; session_id?: string; type: 'review.summary' }
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.spawn_requested' }
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.start' }

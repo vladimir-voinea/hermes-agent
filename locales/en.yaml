@@ -78,8 +78,15 @@ gateway:
     always_plural:         "✅ Commands approved (pattern approved permanently) ({count} commands). The agent is resuming..."
 
   background:
-    usage:                 "Usage: /background <prompt>\nExample: /background Summarize the top HN stories today\n\nRuns the prompt in a separate session. You can keep chatting — the result will appear here when done."
+    usage:                 "Usage: /background <prompt>\nExample: /background Summarize the top HN stories today\n\nRuns the prompt in a separate session. You can keep chatting — the result will appear here when done.\n\nManage running tasks:\n  /background list\n  /background cancel <id|#n>"
     started:               "🔄 Background task started: \"{preview}\"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done."
+    list_empty:            "No background tasks running."
+    list_header:           "🔄 Background tasks ({count}):"
+    list_item:             "#{index} `{task_id}` · {age}s · \"{preview}\""
+    cancel_usage:          "Usage: /background cancel <id|#n>   (see /background list)"
+    cancel_ok:             "🛑 Cancelling `{task_id}` (\"{preview}\") — it will stop within a few seconds."
+    cancel_not_found:      "No running background task matches `{token}`. Try /background list."
+    cancel_ambiguous:      "`{token}` matches multiple tasks: {matches}. Use a longer id or #n."
 
   branch:
     db_unavailable:        "Session database not available."
