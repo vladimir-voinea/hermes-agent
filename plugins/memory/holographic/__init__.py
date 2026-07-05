@@ -377,6 +377,17 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
         ]
+        # Hermes injects skill-invocation and model-switch banners as synthetic
+        # role=user turns. That text is control-plane, NOT something the human
+        # said — capturing it as a fact poisons recall, which then re-injects it
+        # into future agents as if it were a live command (e.g. an agent
+        # spontaneously "resuming" a skill the user never invoked). Skip them.
+        _INJECTION_MARKERS = (
+            "The user has invoked the",
+            "full skill content is loaded below",
+            "model was just switched",
+            "Adjust your self-identification",
+        )
 
         extracted = 0
         for msg in messages:
@@ -384,6 +395,8 @@ class HolographicMemoryProvider(MemoryProvider):
                 continue
             content = msg.get("content", "")
             if not isinstance(content, str) or len(content) < 10:
+                continue
+            if any(marker in content for marker in _INJECTION_MARKERS):
                 continue
 
             for pattern in _PREF_PATTERNS:
