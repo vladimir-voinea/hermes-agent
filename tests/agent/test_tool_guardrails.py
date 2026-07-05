@@ -256,3 +256,58 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+# ── Regression: MCP successes must not trip the repeated-failure block ──
+# XcodeBuildMCP results always carry "error": null on success. The substring
+# classifier used to read that as a failure, so after 5 identical *successful*
+# screenshot calls the repeated_exact_failure_block killed the tool mid-session
+# (broke the ios-ui-inspection skill). Guard the whole chain here.
+
+def _xcodebuild_screenshot_success(seq: int = 0) -> str:
+    return json.dumps({
+        "result": f"\n📷 Screenshot\n\n✅ Screenshot captured\n  └── /tmp/screenshot_{seq}.jpg\n",
+        "structuredContent": {
+            "schema": "xcodebuildmcp.output.capture-result",
+            "schemaVersion": "1",
+            "didError": False,
+            "error": None,
+            "data": {"summary": {"status": "SUCCEEDED"}},
+        },
+    })
+
+
+def test_classify_honors_diderror_false_over_null_error_substring():
+    ok = _xcodebuild_screenshot_success()
+    assert '"error"' in ok  # the very substring that used to false-trigger
+    assert classify_tool_failure("mcp_xcodebuildmcp_screenshot", ok) == (False, "")
+
+
+def test_classify_still_flags_diderror_true():
+    fail = json.dumps({
+        "result": "boom",
+        "structuredContent": {
+            "schema": "x", "schemaVersion": "1",
+            "didError": True, "error": "Simulator not booted", "data": {},
+        },
+    })
+    failed, suffix = classify_tool_failure("mcp_xcodebuildmcp_screenshot", fail)
+    assert failed is True
+    assert "not booted" in suffix
+
+
+def test_repeated_successful_screenshot_is_never_blocked():
+    # The exact sabotage scenario: same successful screenshot call, 6 times,
+    # failed=None so the controller must classify it itself. A success must
+    # never count toward repeated_exact_failure_block.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=5)
+    )
+    args: dict = {}
+    for i in range(6):
+        assert controller.before_call("mcp_xcodebuildmcp_screenshot", args).action == "allow"
+        decision = controller.after_call(
+            "mcp_xcodebuildmcp_screenshot", args, _xcodebuild_screenshot_success(i)
+        )  # failed=None -> exercises classify_tool_failure
+        assert decision.action == "allow"
+    assert controller.before_call("mcp_xcodebuildmcp_screenshot", args).action == "allow"
