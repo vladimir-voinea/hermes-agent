@@ -608,6 +608,10 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    # Per-turn telemetry (TPS + cache-hit %, see agent/turn_telemetry.py).
+    # One PerCallUsage appended per successful API call; a tool-calling turn
+    # can span several calls, aggregated in finalize_turn.
+    _turn_telemetry_calls: List[Any] = []
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -999,6 +1003,10 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        # First-content/reasoning-chunk timestamp for this attempt — the start
+        # of the decode window for turn-telemetry TPS (see agent/turn_telemetry.py).
+        # Reset per retry attempt below; captured by _stop_spinner's on_first_delta.
+        _first_chunk_time = None
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
@@ -1063,6 +1071,7 @@ def run_conversation(
 
             try:
                 agent._reset_stream_delivery_tracking()
+                _first_chunk_time = None  # fresh decode-window start for this attempt
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
                 # switch to a require-side provider (DeepSeek / Kimi / MiMo) that
@@ -1171,7 +1180,9 @@ def run_conversation(
                 # streaming automatically if the provider doesn't
                 # support it.
                 def _stop_spinner():
-                    nonlocal thinking_spinner
+                    nonlocal thinking_spinner, _first_chunk_time
+                    if _first_chunk_time is None:
+                        _first_chunk_time = time.time()
                     if thinking_spinner:
                         thinking_spinner.stop("")
                         thinking_spinner = None
@@ -2149,7 +2160,31 @@ def run_conversation(
                             f"{cached:,}/{prompt:,} tokens "
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
-                
+
+                    # Turn telemetry: record this call's usage + decode timing.
+                    # gen_seconds is the first-content-chunk -> response-received
+                    # window (the actual decode time) when streaming delivered a
+                    # delta; falls back to the whole-request api_duration (marked
+                    # approx=True) for non-streaming calls or providers that never
+                    # fired on_first_delta (e.g. immediate tool-call-only turns).
+                    try:
+                        from agent.turn_telemetry import PerCallUsage as _PerCallUsage
+                        if _first_chunk_time is not None:
+                            _gen_seconds = max(0.0, time.time() - _first_chunk_time)
+                            _approx = False
+                        else:
+                            _gen_seconds = api_duration
+                            _approx = True
+                        _turn_telemetry_calls.append(_PerCallUsage(
+                            prompt_tokens=prompt,
+                            completion_tokens=completion_tokens,
+                            cache_read_tokens=cached,
+                            gen_seconds=_gen_seconds,
+                            approx=_approx,
+                        ))
+                    except Exception:
+                        logger.debug("turn_telemetry: per-call capture failed", exc_info=True)
+
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
@@ -5149,6 +5184,7 @@ def run_conversation(
         original_user_message=original_user_message,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
+        _turn_telemetry_calls=_turn_telemetry_calls,
     )
 
 

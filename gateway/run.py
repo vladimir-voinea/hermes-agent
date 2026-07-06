@@ -11265,6 +11265,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
 
+            # Turn-telemetry footer (TPS + vLLM prefix-cache hit %) — Telegram
+            # only, per telemetry.telegram_footer config (default True).
+            # Computed AFTER the runtime-metadata footer above so the combined
+            # length is what's checked against Telegram's 4096-UTF16-codeunit
+            # limit (format_telegram_footer's default — matches
+            # plugins/platforms/telegram/adapter.py's MAX_MESSAGE_LENGTH);
+            # degrades to omitting the footer (never splits the message) when
+            # it wouldn't fit. Same delivery gates as the runtime footer:
+            # only on a genuinely-final, not-already-streamed, non-silent
+            # response.
+            try:
+                if (
+                    source.platform == Platform.TELEGRAM
+                    and response
+                    and not agent_result.get("already_sent")
+                    and not _intentional_silence
+                ):
+                    from agent.turn_telemetry import (
+                        format_telegram_footer as _format_telemetry_footer,
+                        telemetry_config as _resolve_telemetry_config,
+                    )
+                    from gateway.platforms.base import utf16_len as _utf16_len
+
+                    _telemetry_cfg = _resolve_telemetry_config(_load_gateway_config())
+                    if _telemetry_cfg.get("enabled", True) and _telemetry_cfg.get("telegram_footer", True):
+                        _telemetry_footer = _format_telemetry_footer(
+                            agent_result.get("turn_telemetry"),
+                            current_length=_utf16_len(response),
+                        )
+                        if _telemetry_footer:
+                            response = f"{response}{_telemetry_footer}"
+            except Exception as _telemetry_footer_err:
+                logger.debug("turn_telemetry: footer build failed: %s", _telemetry_footer_err)
+
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,

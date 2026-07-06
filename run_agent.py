@@ -2935,6 +2935,38 @@ class AIAgent:
             pass
         return True  # safe default: explainer on
 
+    def _telemetry_config(self) -> dict:
+        """Resolve the per-turn generation telemetry config block.
+
+        Config path: ``telemetry.enabled`` / ``telemetry.telegram_footer`` /
+        ``telemetry.jsonl`` (all bool, default True — see
+        ``agent/turn_telemetry.py`` module docstring for the shape).
+        ``HERMES_TELEMETRY`` env var overrides the master ``enabled`` switch
+        only (the two sub-toggles stay config-only; there's no compelling
+        env-var use case for muting just the footer or just the JSONL sink).
+        Exposed as a method so tests can patch a single seam, mirroring
+        ``_file_mutation_verifier_enabled`` / ``_turn_completion_explainer_enabled``.
+        """
+        resolved = {"enabled": True, "telegram_footer": True, "jsonl": True}
+        try:
+            import os as _os
+            env = _os.environ.get("HERMES_TELEMETRY")
+            if env is not None:
+                resolved["enabled"] = env.strip().lower() not in {"0", "false", "no", "off"}
+                return resolved
+            # Read from the persisted config.yaml so gateway and CLI share
+            # the same setting.  Import lazily to avoid a startup-time cycle.
+            try:
+                from hermes_cli.config import load_config as _load_config
+                _cfg = _load_config() or {}
+            except Exception:
+                _cfg = {}
+            from agent.turn_telemetry import telemetry_config as _resolve_telemetry_config
+            return _resolve_telemetry_config(_cfg if isinstance(_cfg, dict) else {})
+        except Exception:
+            pass
+        return resolved  # safe default: everything on
+
     @staticmethod
     def _format_turn_completion_explanation(turn_exit_reason: str) -> str:
         """Render a user-facing explanation for an abnormal turn ending.
