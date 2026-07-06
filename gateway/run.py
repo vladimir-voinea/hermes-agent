@@ -9912,6 +9912,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
+            # Idle-time compaction + KV pre-warm: after the response is
+            # delivered, if context usage crossed the SOFT threshold, compress
+            # in the background so the NEXT turn starts already-compacted
+            # instead of paying summarization + a cold re-prefill in-turn. Also
+            # warm the server prefix after any compaction (background OR the
+            # in-turn hard backstop that fired this turn). Fully guarded — this
+            # can never break normal message handling.
+            try:
+                self._schedule_background_compression_after_turn(
+                    source, _quick_key, _agent_result
+                )
+            except Exception as _bg_exc:
+                logger.debug("background compression hook failed: %s", _bg_exc)
             return _agent_result
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
@@ -12299,6 +12312,183 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
+
+    def _cached_agent_for_session(self, session_key: str) -> Any:
+        """Return the AIAgent cached for *session_key*, or None.
+
+        The cache entry is a tuple whose ``[0]`` is the agent (see run_sync's
+        ``_cache[session_key] = (agent, sig, msg_count, session_id)``). Read
+        under the cache lock, matching every other reader in this file.
+        """
+        _cache = getattr(self, "_agent_cache", None)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _cache is None:
+            return None
+        try:
+            if _lock is not None:
+                with _lock:
+                    entry = _cache.get(session_key)
+            else:
+                entry = _cache.get(session_key)
+        except Exception:
+            return None
+        if not entry:
+            return None
+        agent = entry[0] if isinstance(entry, tuple) else entry
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return None
+        return agent
+
+    def _schedule_background_compression_after_turn(
+        self, source: Any, session_key: str, agent_result: Any
+    ) -> None:
+        """Arm post-delivery idle compaction + KV pre-warm for a finished turn.
+
+        Runs AFTER the turn's final response is produced, mirroring the goal
+        continuation precedent. Two independent pieces, both gated on their own
+        config flag and both no-ops when the session is busy at fire time:
+
+          * background compaction — when context usage sits in the soft band
+            (soft_ratio * hard threshold .. hard threshold), compress now so the
+            next turn starts compacted. The hard in-turn backstop is untouched;
+            the compression lock makes a race with a starting real turn resolve
+            to exactly one compression.
+          * KV pre-warm — after any compaction this turn (the background one we
+            just ran, OR the in-turn hard backstop that already fired) send one
+            max_tokens=1 request so the server re-prefills the rewritten prefix
+            while nobody is waiting.
+
+        Both run in the gateway executor (compaction is blocking) and only via a
+        registered post-delivery callback so the user sees their reply first.
+        Nothing here may raise into the caller.
+        """
+        agent = self._cached_agent_for_session(session_key)
+        if agent is None:
+            return
+        if not getattr(agent, "compression_enabled", False):
+            return
+
+        # Did an in-turn compaction already fire this turn? Either the
+        # rotation/in-place flag on the result, or the agent's own flag.
+        _in_turn_compacted = False
+        try:
+            if isinstance(agent_result, dict):
+                _in_turn_compacted = bool(agent_result.get("compacted_in_place"))
+            _in_turn_compacted = _in_turn_compacted or bool(
+                getattr(agent, "_last_compaction_in_place", False)
+            )
+        except Exception:
+            _in_turn_compacted = False
+
+        _background_enabled = bool(getattr(agent, "compression_background", False))
+        _prewarm_enabled = bool(getattr(agent, "compression_prewarm", False))
+
+        # Cheap arming pre-check for the background compress (the definitive
+        # check + lock happens on the worker thread). Uses the SAME usage
+        # accounting as the in-turn threshold check.
+        _armed_background = False
+        if _background_enabled:
+            try:
+                from agent.conversation_compression import (
+                    current_context_usage_tokens,
+                    should_background_compress,
+                )
+                _compressor = getattr(agent, "context_compressor", None)
+                _threshold = int(getattr(_compressor, "threshold_tokens", 0) or 0) if _compressor else 0
+                _soft_ratio = float(getattr(agent, "compression_soft_ratio", 0.8) or 0.8)
+                _messages = list(getattr(agent, "_session_messages", None) or [])
+                _sys = getattr(agent, "_cached_system_prompt", None) or ""
+                _usage = current_context_usage_tokens(agent, _messages, _sys)
+                _armed_background = should_background_compress(
+                    usage_tokens=_usage,
+                    threshold_tokens=_threshold,
+                    soft_ratio=_soft_ratio,
+                )
+            except Exception:
+                _armed_background = False
+
+        # Nothing to do: no soft-band compaction to run and no compaction this
+        # turn to warm after.
+        if not _armed_background and not (_prewarm_enabled and _in_turn_compacted):
+            return
+
+        def _do_idle_work() -> None:
+            # Runs on the gateway executor thread. Re-check busy at fire time —
+            # a new turn may have started between arming and delivery; if so,
+            # skip and let the next delivery re-evaluate.
+            try:
+                running = self._running_agents.get(session_key)
+            except Exception:
+                running = None
+            if running is not None and running is not _AGENT_PENDING_SENTINEL:
+                logger.debug(
+                    "background compaction skipped: session %s became busy",
+                    session_key,
+                )
+                return
+            _compacted_now = False
+            if _armed_background:
+                try:
+                    from agent.conversation_compression import maybe_background_compress
+                    _messages = list(getattr(agent, "_session_messages", None) or [])
+                    _sys = getattr(agent, "_cached_system_prompt", None) or ""
+                    _compacted_now = maybe_background_compress(
+                        agent, _messages, _sys, task_id=session_key or "default"
+                    )
+                except Exception as exc:
+                    logger.debug("background compaction worker failed: %s", exc)
+            # Pre-warm after any compaction this turn: the one we just ran, or
+            # the in-turn backstop that already fired.
+            if _prewarm_enabled and (_compacted_now or _in_turn_compacted):
+                # Busy could have flipped while compacting; re-check so we never
+                # warm concurrently with a real user turn.
+                try:
+                    running2 = self._running_agents.get(session_key)
+                except Exception:
+                    running2 = None
+                if running2 is not None and running2 is not _AGENT_PENDING_SENTINEL:
+                    return
+                try:
+                    from agent.conversation_compression import prewarm_after_compression
+                    _timeout = float(getattr(agent, "compression_prewarm_timeout", 120.0) or 120.0)
+                    _warm_msgs = list(getattr(agent, "_session_messages", None) or [])
+                    prewarm_after_compression(agent, _warm_msgs, timeout=_timeout)
+                except Exception as exc:
+                    logger.debug("prewarm worker failed: %s", exc)
+
+        async def _deliver() -> None:
+            try:
+                await self._run_in_executor_with_context(_do_idle_work)
+            except Exception as exc:
+                logger.debug("background compaction dispatch failed: %s", exc)
+
+        # Defer to after the adapter delivers the reply (same one-shot
+        # post-delivery boundary the goal-status notice uses). Fall back to
+        # firing directly when the adapter has no such hook.
+        adapter = self.adapters.get(getattr(source, "platform", None))
+        if adapter is not None and hasattr(adapter, "register_post_delivery_callback"):
+            try:
+                generation = None
+                active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                if active is not None:
+                    generation = getattr(active, "_hermes_run_generation", None)
+                adapter.register_post_delivery_callback(
+                    session_key, _deliver, generation=generation
+                )
+                return
+            except Exception as exc:
+                logger.debug(
+                    "background compaction: post-delivery registration failed: %s", exc
+                )
+
+        # No adapter hook — schedule the deferred work as a tracked background
+        # task so it still runs off the current turn without blocking it.
+        try:
+            task = asyncio.create_task(_deliver())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except Exception as exc:
+            logger.debug("background compaction: task scheduling failed: %s", exc)
 
 
 
