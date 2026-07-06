@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
-DEFAULT_JUDGE_TIMEOUT = 30.0
+DEFAULT_JUDGE_TIMEOUT = 180.0
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
 # before emitting the visible JSON — and the first /goal turn's prompt is
