@@ -973,10 +973,18 @@ class KawaiiSpinner:
         "٩(๑❛ᴗ❛๑)۶", "(⊙_⊙)", "(¬_¬)", "( ͡° ͜ʖ ͡°)", "ಠ_ಠ",
     ]
 
+    # THINKING_VERBS = [
+    #     "pondering", "contemplating", "musing", "cogitating", "ruminating",
+    #     "deliberating", "mulling", "reflecting", "processing", "reasoning",
+    #     "analyzing", "computing", "synthesizing", "formulating", "brainstorming",
+    # ]
+    # Note: the "…" is appended by the renderer (f"{face} {verb}..."), so verbs
+    # are stored bare here to avoid a doubled ellipsis.
     THINKING_VERBS = [
-        "pondering", "contemplating", "musing", "cogitating", "ruminating",
-        "deliberating", "mulling", "reflecting", "processing", "reasoning",
-        "analyzing", "computing", "synthesizing", "formulating", "brainstorming",
+        "marinating", "percolating", "noodling", "ruminating", "ideating",
+        "contemplating", "fermenting", "simmering", "wrangling", "puttering",
+        "divining", "spelunking", "doodling", "meandering", "tinkering",
+        "conjuring", "marveling", "loitering", "untangling", "bamboozling",
     ]
 
     @classmethod
