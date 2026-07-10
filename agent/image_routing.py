@@ -177,16 +177,20 @@ def _coerce_capability_bool(raw: Any) -> Optional[bool]:
     return None
 
 
-def _supports_vision_override(
+def _supports_capability_override(
     cfg: Optional[Dict[str, Any]],
     provider: str,
     model: str,
+    key: str,
 ) -> Optional[bool]:
-    """Resolve user-declared vision capability from config.yaml.
+    """Resolve a user-declared capability flag (*key*) from config.yaml.
+
+    ``key`` is the config field name, e.g. ``"supports_vision"`` or
+    ``"supports_audio_input"``.
 
     Resolution order, first hit wins:
-      1. ``model.supports_vision`` (top-level shortcut for the active model)
-      2. ``providers.<provider>.models.<model>.supports_vision``
+      1. ``model.<key>`` (top-level shortcut for the active model)
+      2. ``providers.<provider>.models.<model>.<key>``
          (named custom providers — ``provider`` may be the runtime-resolved
          value ``"custom"`` and/or the user-declared name under
          ``model.provider``; both are tried. For ``custom:<name>`` syntax,
@@ -202,7 +206,7 @@ def _supports_vision_override(
     # 1. Top-level shortcut
     model_cfg_raw = cfg.get("model")
     model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
-    top = _coerce_capability_bool(model_cfg.get("supports_vision"))
+    top = _coerce_capability_bool(model_cfg.get(key))
     if top is not None:
         return top
 
@@ -226,7 +230,7 @@ def _supports_vision_override(
         models_cfg: Dict[str, Any] = models_raw if isinstance(models_raw, dict) else {}
         per_model_raw = models_cfg.get(model)
         per_model: Dict[str, Any] = per_model_raw if isinstance(per_model_raw, dict) else {}
-        coerced = _coerce_capability_bool(per_model.get("supports_vision"))
+        coerced = _coerce_capability_bool(per_model.get(key))
         if coerced is not None:
             return coerced
 
@@ -254,11 +258,25 @@ def _supports_vision_override(
             models_cfg = models_raw if isinstance(models_raw, dict) else {}
             per_model_raw = models_cfg.get(model)
             per_model = per_model_raw if isinstance(per_model_raw, dict) else {}
-            coerced = _coerce_capability_bool(per_model.get("supports_vision"))
+            coerced = _coerce_capability_bool(per_model.get(key))
             if coerced is not None:
                 return coerced
 
     return None
+
+
+def _supports_vision_override(
+    cfg: Optional[Dict[str, Any]],
+    provider: str,
+    model: str,
+) -> Optional[bool]:
+    """Back-compat wrapper: resolve the ``supports_vision`` override.
+
+    Kept because external callers (run_agent, computer_use vision routing,
+    tests) import this name directly. New capability keys should call
+    :func:`_supports_capability_override` with an explicit ``key``.
+    """
+    return _supports_capability_override(cfg, provider, model, key="supports_vision")
 
 
 def _resolve_inference_base_url(

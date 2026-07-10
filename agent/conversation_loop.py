@@ -44,6 +44,7 @@ from agent.message_sanitization import (
     _sanitize_structure_surrogates,
     _sanitize_surrogates,
     _sanitize_tools_non_ascii,
+    _strip_audio_from_messages,
     _strip_images_from_messages,
     _strip_non_ascii,
 )
@@ -2600,6 +2601,40 @@ def run_conversation(
                         force=True,
                     )
                     continue
+
+                # ── Audio-rejection recovery ──────────────────────────────
+                # Same idea as the image branch above: an audio-blind
+                # endpoint (or a text-only frontend on an audio-native
+                # model) rejects `input_audio` content parts with a 4xx
+                # error that names the offending type.  On first hit,
+                # replace the audio parts with a text note, mark the
+                # session as audio-unsupported, and retry.
+                _AUDIO_REJECTION_PHRASES = (
+                    "input_audio",
+                    "does not support audio",
+                    "audio input is not supported",
+                    "audio content is not supported",
+                    "audio is not supported",
+                )
+                _looks_like_audio_rejection = any(
+                    p in _err_lower for p in _AUDIO_REJECTION_PHRASES
+                )
+                if (
+                    getattr(agent, "_audio_supported", True)
+                    and _looks_like_audio_rejection
+                    and _status_ok
+                ):
+                    agent._audio_supported = False
+                    _audio_removed = _strip_audio_from_messages(messages)
+                    if isinstance(api_messages, list):
+                        _strip_audio_from_messages(api_messages)
+                    if _audio_removed:
+                        agent._vprint(
+                            f"{agent.log_prefix}⚠️  Server rejected audio content — "
+                            f"stripped audio from history and retrying.",
+                            force=True,
+                        )
+                        continue
 
                 status_code = getattr(api_error, "status_code", None)
                 error_context = agent._extract_api_error_context(api_error)

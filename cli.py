@@ -11397,6 +11397,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         submitted = False
         transcription_failed = False
+        keep_recording = False
         wav_path = None
         try:
             if self._voice_recorder is None:
@@ -11414,6 +11415,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             if wav_path is None:
                 _cprint(f"{_DIM}No speech detected.{_RST}")
+                return
+
+            # Native audio path: when the active model accepts input_audio
+            # content (Nemotron-3 Nano Omni etc.), skip STT and hand the raw
+            # WAV to chat() as a 3-tuple.  chat() re-decides against the
+            # turn-resolved model and degrades to STT there if needed — this
+            # is only the record-time routing hint.
+            try:
+                from agent.audio_routing import decide_audio_input_mode
+                from hermes_cli.config import load_config
+                _audio_mode = decide_audio_input_mode(
+                    (self.provider or "").strip(),
+                    (self.model or "").strip(),
+                    load_config(),
+                )
+            except Exception:
+                _audio_mode = "stt"
+            if _audio_mode == "native":
+                self._attached_images.clear()
+                if hasattr(self, '_app') and self._app:
+                    self._app.invalidate()
+                self._pending_input.put(("[voice message]", [], [wav_path]))
+                submitted = True
+                keep_recording = True
+                _cprint(f"{_DIM}Voice → native audio (no STT).{_RST}")
                 return
 
             # _voice_processing is already True (set atomically above)
@@ -11456,9 +11482,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if hasattr(self, '_app') and self._app:
                 self._app.invalidate()
             # Clean up temp file unless transcription failed. On failure, keep
-            # the source recording so long dictation is not lost.
+            # the source recording so long dictation is not lost.  Native-audio
+            # submissions also keep the WAV — chat() reads it at send time.
             try:
-                if wav_path and os.path.isfile(wav_path):
+                if wav_path and os.path.isfile(wav_path) and not keep_recording:
                     if transcription_failed:
                         _cprint(f"{_DIM}Recording preserved at: {wav_path}{_RST}")
                     else:
@@ -12213,22 +12240,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None) -> Optional[str]:
+    def chat(self, message, images: list = None, audio: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
-        
+
         Handles streaming output, interrupt detection (user typing while agent
         is working), and re-queueing of interrupted messages.
-        
+
         Uses a dedicated _interrupt_queue (separate from _pending_input) to avoid
         race conditions between the process_loop and interrupt monitoring. Messages
         typed while the agent is running go to _interrupt_queue; messages typed while
         idle go to _pending_input.
-        
+
         Args:
             message: The user's message (str or multimodal content list)
             images: Optional list of Path objects for attached images
-            
+            audio: Optional list of WAV path strings from /voice recordings
+
         Returns:
             The agent's response, or None on error
         """
@@ -12316,6 +12344,82 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 message = self._preprocess_images_with_vision(
                     message if isinstance(message, str) else "", images
                 )
+
+        # Route voice recordings based on the active model's audio capability.
+        # The record-time decision in _voice_stop_and_transcribe was only a
+        # hint — the model may have changed between record and send (per-turn
+        # routing, /model mid-queue), so re-decide against the TURN-RESOLVED
+        # model here. Anything short of a clean native attach degrades to STT
+        # so the turn always goes through. See agent/audio_routing.py.
+        if audio:
+            _audio_parts = None
+            try:
+                from agent.audio_routing import (
+                    build_native_audio_parts,
+                    decide_audio_input_mode,
+                )
+                from hermes_cli.config import load_config
+
+                _audio_mode = decide_audio_input_mode(
+                    (self.provider or "").strip(),
+                    (self.model or "").strip(),
+                    load_config(),
+                )
+                if _audio_mode == "native":
+                    _caption = message if isinstance(message, str) else ""
+                    if _caption.strip() == "[voice message]":
+                        _caption = ""
+                    _audio_parts, _audio_err = build_native_audio_parts(
+                        _caption,
+                        str(audio[0]),
+                        voice_mode=bool(self._voice_mode),
+                    )
+                    if _audio_err:
+                        logging.warning("native audio attach failed: %s", _audio_err)
+            except Exception as _audio_exc:
+                logging.warning("audio_routing failed, falling back to STT: %s", _audio_exc)
+                _audio_parts = None
+
+            if _audio_parts:
+                _cprint(f"  {_DIM}🎤 attaching voice audio natively{_RST}")
+                if isinstance(message, list):
+                    # Images already built a content-parts list — append only
+                    # the input_audio part so their combined text is kept.
+                    message = message + [
+                        p for p in _audio_parts if p.get("type") == "input_audio"
+                    ]
+                else:
+                    message = _audio_parts
+            else:
+                # Not native (or attach failed) — degrade to the STT path.
+                _cprint(f"{_DIM}Transcribing...{_RST}")
+                try:
+                    from hermes_cli.config import load_config
+                    _stt_model = (load_config().get("stt", {}) or {}).get("model")
+                except Exception:
+                    _stt_model = None
+                try:
+                    from tools.voice_mode import transcribe_recording
+                    _stt_result = transcribe_recording(str(audio[0]), model=_stt_model)
+                except Exception as _stt_exc:
+                    _stt_result = {"success": False, "error": str(_stt_exc)}
+                if _stt_result.get("success") and _stt_result.get("transcript", "").strip():
+                    _transcript = _stt_result["transcript"].strip()
+                    if isinstance(message, str) and message.strip() not in ("", "[voice message]"):
+                        message = f"{message}\n\n{_transcript}"
+                    elif isinstance(message, list):
+                        message = message + [{"type": "text", "text": _transcript}]
+                    else:
+                        message = _transcript
+                else:
+                    _stt_error = _stt_result.get("error", "no speech detected")
+                    _cprint(f"{_DIM}Transcription failed: {_stt_error}{_RST}")
+                    _note = (
+                        f"[Voice recording at {audio[0]} could not be attached "
+                        f"natively or transcribed: {_stt_error}]"
+                    )
+                    if isinstance(message, str) and message.strip() in ("", "[voice message]"):
+                        message = _note
 
         # Expand @ context references (e.g. @file:main.py, @diff, @folder:src/)
         if isinstance(message, str) and "@" in message:
@@ -15331,10 +15435,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
 
-                    # Unpack image payload: (text, [Path, ...]) or plain str
+                    # Unpack image payload: (text, [Path, ...]) or plain str.
+                    # Voice submissions extend to a 3-tuple with WAV paths:
+                    # (text, [Path, ...], [wav_path, ...]).
                     submit_images = []
+                    submit_audio = []
                     if isinstance(user_input, tuple):
-                        user_input, submit_images = user_input
+                        if len(user_input) == 3:
+                            user_input, submit_images, submit_audio = user_input
+                        else:
+                            user_input, submit_images = user_input
 
                     if isinstance(user_input, str):
                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
@@ -15417,7 +15527,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        self.chat(user_input, images=submit_images or None, audio=submit_audio or None)
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

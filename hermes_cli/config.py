@@ -1157,6 +1157,18 @@ DEFAULT_CONFIG = {
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
+        # How /voice recordings are presented to the main model.
+        #   "auto"   — send the raw WAV as a native input_audio content part
+        #              when the active model reports supports_audio_input=True
+        #              (config override or models.dev metadata); otherwise
+        #              transcribe with STT and send text (the historical path).
+        #   "native" — always attach the WAV natively; audio-blind models will
+        #              error at the provider (recovered by stripping audio).
+        #   "stt"    — always transcribe; the model never hears the audio.
+        # STT remains the default and the fallback whenever native attachment
+        # can't be built (unreadable WAV, mode re-check on the turn-resolved
+        # model says no).
+        "audio_input_mode": "auto",
         "disabled_toolsets": [],
     },
     
