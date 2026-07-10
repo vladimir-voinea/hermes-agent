@@ -464,6 +464,7 @@ class AIAgent:
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
+        tool_args_callback: callable = None,
         status_callback: callable = None,
         notice_callback: callable = None,
         notice_clear_callback: callable = None,
@@ -539,6 +540,7 @@ class AIAgent:
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
             tool_gen_callback=tool_gen_callback,
+            tool_args_callback=tool_args_callback,
             status_callback=status_callback,
             notice_callback=notice_callback,
             notice_clear_callback=notice_clear_callback,
@@ -4719,6 +4721,23 @@ class AIAgent:
         if cb is not None:
             try:
                 cb(tool_name)
+            except Exception:
+                pass
+
+    def _fire_tool_args_delta(self, idx: int, tool_name: str, accumulated_args: str) -> None:
+        """Stream partial tool-call arguments to the display as they generate.
+
+        Fires on every arguments delta of a streaming tool call, carrying the
+        FULL accumulated arguments-JSON-so-far (the display re-scans it and
+        emits only the newly-revealed portion).  Lets the TUI live-render a
+        big ``write_file`` content payload instead of freezing on a spinner
+        while dozens of KB stream in one shot.  ``idx`` keys the tool-call
+        slot so parallel/sequential calls in one turn don't collide.
+        """
+        cb = getattr(self, "tool_args_callback", None)
+        if cb is not None:
+            try:
+                cb(idx, tool_name, accumulated_args)
             except Exception:
                 pass
 

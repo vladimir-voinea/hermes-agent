@@ -5896,6 +5896,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._deferred_content = ""
         self._stream_table_buf = []
         self._in_stream_table = False
+        self._tool_args_state = {}
+        self._tool_args_active_idx = None
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -10779,10 +10781,150 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._flush_stream()
             self._stream_box_opened = False
         self._close_reasoning_box()
+        # Close a previous tool's live-args box before announcing the next tool.
+        self._close_tool_args_box()
 
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚡")
         _cprint(f"  ┊ {emoji} preparing {tool_name}…")
+
+    # ====================================================================
+    # Live tool-argument streaming (real-time write_file content, etc.)
+    # ====================================================================
+
+    # Tool-argument JSON fields worth live-streaming (the big text payload),
+    # and the fields that name the file (used only for the box header).
+    _TOOL_ARGS_PREVIEW_FIELDS = ("content", "new_string", "new_str", "file_text", "text", "code")
+    _TOOL_ARGS_PATH_FIELDS = ("file_path", "path", "filename", "target_file", "file")
+
+    @staticmethod
+    def _find_json_string_value(s: str, keys):
+        """Return (value_start, key) for the earliest ``"key"\\s*:\\s*"`` among
+        ``keys`` in ``s`` (value_start = index just past the opening quote), or
+        (None, None). Earliest-match wins so JSON key order doesn't matter."""
+        import re
+        best_pos = None
+        best = (None, None)
+        for k in keys:
+            m = re.search(r'"' + re.escape(k) + r'"\s*:\s*"', s)
+            if m and (best_pos is None or m.end() < best_pos):
+                best_pos = m.end()
+                best = (m.end(), k)
+        return best
+
+    @staticmethod
+    def _decode_json_str_chunk(s: str, start: int):
+        """Decode a JSON string body from ``start`` up to the closing quote or
+        the end of available text.  Returns (decoded, ended, next_start).
+        Stops BEFORE an incomplete trailing escape (``\\`` or partial ``\\uXXXX``
+        at end of ``s``) so the caller can resume at ``next_start`` when more
+        text streams in — keeping the whole scan O(total content), not O(n²)."""
+        out = []
+        i = start
+        n = len(s)
+        _SIMPLE = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\",
+                   "/": "/", "b": "\b", "f": "\f"}
+        while i < n:
+            c = s[i]
+            if c == '"':
+                return ("".join(out), True, i)
+            if c == "\\":
+                if i + 1 >= n:
+                    break  # escape char not yet arrived
+                e = s[i + 1]
+                if e in _SIMPLE:
+                    out.append(_SIMPLE[e]); i += 2
+                elif e == "u":
+                    if i + 6 > n:
+                        break  # incomplete \uXXXX
+                    try:
+                        out.append(chr(int(s[i + 2:i + 6], 16)))
+                    except ValueError:
+                        out.append(s[i + 2:i + 6])
+                    i += 6
+                else:
+                    out.append(e); i += 2
+            else:
+                out.append(c); i += 1
+        return ("".join(out), False, i)
+
+    def _on_tool_args_delta(self, idx: int, tool_name: str, accumulated_args: str) -> None:
+        """Live-render a streaming tool call's big text payload (e.g. a one-shot
+        45 KB ``write_file`` content field) so the screen shows the file being
+        written in real time instead of freezing on a ``preparing…`` spinner."""
+        if not getattr(self, "streaming_enabled", False):
+            return
+        state = getattr(self, "_tool_args_state", None)
+        if state is None:
+            state = self._tool_args_state = {}
+        st = state.get(idx)
+        if st is None:
+            st = state[idx] = {"scan": None, "buf": "", "open": False, "skip": False, "done": False}
+        if st["skip"] or st["done"]:
+            return
+        # Locate the payload field's value the first time it appears.
+        if st["scan"] is None:
+            vstart, _f = self._find_json_string_value(accumulated_args, self._TOOL_ARGS_PREVIEW_FIELDS)
+            if vstart is None:
+                # No previewable field.  Give up once the JSON has clearly moved
+                # past where it'd appear (small tools like read_file/bash).
+                if len(accumulated_args) > 800 or accumulated_args.rstrip().endswith("}"):
+                    st["skip"] = True
+                return
+            st["scan"] = vstart
+        new, ended, next_scan = self._decode_json_str_chunk(accumulated_args, st["scan"])
+        st["scan"] = next_scan
+        if not new and not ended:
+            return
+        active = getattr(self, "_tool_args_active_idx", None)
+        if active is not None and active != idx:
+            self._close_tool_args_box()
+        if not st["open"]:
+            if getattr(self, "_stream_box_opened", False):
+                self._flush_stream()
+                self._stream_box_opened = False
+            self._close_reasoning_box()
+            pstart, _pk = self._find_json_string_value(accumulated_args, self._TOOL_ARGS_PATH_FIELDS)
+            path = None
+            if pstart is not None:
+                path, _pe, _pn = self._decode_json_str_chunk(accumulated_args, pstart)
+            w = self._scrollback_box_width()
+            label = f" ✎ {path or tool_name or 'writing'} "
+            if len(label) > w - 4:
+                label = label[: w - 4]
+            fill = w - 2 - len(label)
+            _cprint(f"{_DIM}┌─{label}{'─' * max(fill - 1, 0)}┐{_RST}")
+            st["open"] = True
+            self._tool_args_active_idx = idx
+        st["buf"] += new
+        while "\n" in st["buf"]:
+            line, st["buf"] = st["buf"].split("\n", 1)
+            _cprint(f"{_DIM}{line}{_RST}")
+        if len(st["buf"]) > 160:  # force-flush long unbroken lines
+            _cprint(f"{_DIM}{st['buf']}{_RST}")
+            st["buf"] = ""
+        if ended:
+            self._close_tool_args_box()
+            st["done"] = True
+
+    def _close_tool_args_box(self) -> None:
+        """Flush + close the live tool-args box if one is open."""
+        state = getattr(self, "_tool_args_state", None)
+        if not state:
+            return
+        closed = False
+        for st in state.values():
+            if st.get("open"):
+                buf = st.get("buf", "")
+                if buf:
+                    _cprint(f"{_DIM}{buf}{_RST}")
+                    st["buf"] = ""
+                st["open"] = False
+                closed = True
+        if closed:
+            w = self._scrollback_box_width()
+            _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
+        self._tool_args_active_idx = None
 
     # ====================================================================
     # Tool progress callback (audio cues for voice mode)
@@ -10919,6 +11061,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
     def _on_tool_start(self, tool_call_id: str, function_name: str, function_args: dict):
         """Capture local before-state for write-capable tools."""
+        # Close the live-args box (if still open) before the tool result / diff
+        # renders — this is the backstop if the stream ended without a closing
+        # quote (truncation / interrupt).
+        self._close_tool_args_box()
         try:
             from agent.display import capture_local_edit_snapshot
 
@@ -15978,6 +16124,7 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        cli.agent.tool_args_callback = None
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,

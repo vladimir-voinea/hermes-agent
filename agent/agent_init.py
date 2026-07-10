@@ -204,6 +204,7 @@ def init_agent(
     stream_delta_callback: callable = None,
     interim_assistant_callback: callable = None,
     tool_gen_callback: callable = None,
+    tool_args_callback: callable = None,
     status_callback: callable = None,
     notice_callback: callable = None,
     notice_clear_callback: callable = None,
@@ -442,6 +443,7 @@ def init_agent(
     agent.notice_clear_callback = notice_clear_callback
     agent.event_callback = event_callback
     agent.tool_gen_callback = tool_gen_callback
+    agent.tool_args_callback = tool_args_callback
 
     
     # Tool execution state — allows _vprint during tool execution
