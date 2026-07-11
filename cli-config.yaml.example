@@ -448,31 +448,6 @@ compression:
   # head messages, matching the pre-feature behaviour.
   protect_first_n: 3
 
-  # ── Idle-time (post-delivery) compaction + KV pre-warm (gateway) ──
-  # When true, AFTER a turn's reply is delivered the gateway checks whether
-  # context usage has crossed a SOFT threshold and, if so, compacts in the
-  # background so the NEXT turn starts already-compacted instead of paying
-  # summarization + a cold re-prefill in-turn. The synchronous in-turn
-  # compaction paths remain as the hard backstop. Gateway-only (default: true).
-  background: true
-
-  # Fraction of the hard `threshold` at which background compaction is armed.
-  # 0.8 = compact in the background once usage reaches 80% of the threshold
-  # that would otherwise force an in-turn compress. Range: (0, 1); out-of-range
-  # values fall back to 0.8.
-  soft_ratio: 0.8
-
-  # After ANY successful compaction (background OR in-turn), send one
-  # max_tokens=1 warm-up request so the inference server re-prefills the new
-  # prefix while nobody is waiting — the next real turn then hits a warm prefix
-  # cache. Fire-and-forget; failures are ignored. Most valuable for local
-  # servers with prefix caching (e.g. vLLM). (default: true)
-  prewarm: true
-
-  # Hard timeout (seconds) for the KV pre-warm request. On expiry the warm-up
-  # is abandoned silently — it never blocks or delays a user turn. (default: 120)
-  prewarm_timeout: 120
-
   # To pin a specific model/provider for compression summaries, use the
   # auxiliary section below (auxiliary.compression.provider / model).
 

@@ -1583,37 +1583,6 @@ def init_agent(
         )
         codex_app_server_auto_compaction = "native"
 
-    # Idle-time (post-delivery) compression + KV pre-warm. Read here off the
-    # same ``compression`` config block so gateway and CLI share one seam; the
-    # values ride on the agent and are consumed by the gateway's post-delivery
-    # hook (see gateway/run.py::_schedule_background_compression_after_turn)
-    # and agent/conversation_compression.py::prewarm_after_compression. All
-    # default-on; each flag independently disableable. See ``compression``
-    # defaults in hermes_cli/config.py.
-    compression_background = is_truthy_value(
-        _compression_cfg.get("background"), default=True
-    )
-    try:
-        compression_soft_ratio = float(_compression_cfg.get("soft_ratio", 0.8))
-    except (TypeError, ValueError):
-        compression_soft_ratio = 0.8
-    # Clamp to (0, 1): a soft ratio >= 1 would never arm before the hard
-    # backstop (pointless), and <= 0 would arm on every turn. Keep it strictly
-    # between so "soft" always means "earlier than the hard threshold".
-    if not (0.0 < compression_soft_ratio < 1.0):
-        compression_soft_ratio = 0.8
-    compression_prewarm = is_truthy_value(
-        _compression_cfg.get("prewarm"), default=True
-    )
-    try:
-        compression_prewarm_timeout = float(
-            _compression_cfg.get("prewarm_timeout", 120)
-        )
-    except (TypeError, ValueError):
-        compression_prewarm_timeout = 120.0
-    if compression_prewarm_timeout <= 0:
-        compression_prewarm_timeout = 120.0
-
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
     # /models, so the startup feasibility check needs the config hint.
@@ -1867,10 +1836,6 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
-    agent.compression_background = compression_background
-    agent.compression_soft_ratio = compression_soft_ratio
-    agent.compression_prewarm = compression_prewarm
-    agent.compression_prewarm_timeout = compression_prewarm_timeout
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
 
     # Reject models whose context window is below the minimum required

@@ -1488,40 +1488,6 @@ DEFAULT_CONFIG = {
                                       # session_search and recoverable, not deleted.
                                       # Default False during rollout; will flip on
                                       # after live validation.
-        "background": True,           # When True, after a turn's final response is
-                                      # DELIVERED the gateway checks whether context
-                                      # usage has crossed the SOFT threshold
-                                      # (soft_ratio * hard threshold) and, if so,
-                                      # compresses in the background so the NEXT turn
-                                      # starts from an already-compacted history
-                                      # instead of paying summarization + a cold
-                                      # re-prefill in-turn. The synchronous in-turn
-                                      # compaction paths remain as the hard backstop.
-                                      # Gateway-only (no post-delivery boundary in the
-                                      # bare CLI). Set False to keep all compaction
-                                      # in-turn.
-        "soft_ratio": 0.8,            # Fraction of the hard compression threshold at
-                                      # which post-delivery background compression is
-                                      # armed. 0.8 = compress in the background once
-                                      # usage reaches 80% of the threshold that would
-                                      # otherwise force an in-turn compress. Clamped to
-                                      # the open interval (0, 1); out-of-range values
-                                      # fall back to 0.8.
-        "prewarm": True,              # When True, after ANY successful compression
-                                      # (background OR in-turn) fire a single
-                                      # max_tokens=1 warm-up request so the inference
-                                      # server re-prefills the new prefix while nobody
-                                      # is waiting. The warm-up prompt is built through
-                                      # the exact same code path as the real next call
-                                      # (identical messages/tools/system prompt) so the
-                                      # server-side prefix cache is populated for the
-                                      # real request. Fire-and-forget; any failure is
-                                      # debug-logged and ignored. Set False to skip.
-        "prewarm_timeout": 120,       # Hard timeout (seconds) for the KV pre-warm
-                                      # request. On expiry the warm-up is abandoned
-                                      # silently — it never blocks or delays a user
-                                      # turn. Must be > 0; non-positive falls back to
-                                      # 120.
     },
 
     # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
