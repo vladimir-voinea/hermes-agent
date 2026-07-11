@@ -294,15 +294,23 @@ def _create_session_db_for_oneshot():
         return None
 
 
-def _run_agent(
+def build_oneshot_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
-) -> tuple[str, dict]:
-    """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.  Returns ``(final_response, run_result)``."""
+    agent_overrides: Optional[dict] = None,
+):
+    """Build a fully-wired AIAgent exactly like a normal CLI chat turn would
+    (provider/model/creds/toolsets/session/fallback resolution) but WITHOUT
+    running it — returns the unrun agent so callers can attach monitoring
+    callbacks (``event_callback``), run ``run_conversation`` in a worker
+    thread, and ``steer()`` / ``interrupt()`` it from another thread.
+
+    ``agent_overrides`` is merged into the final ``AIAgent(**kwargs)`` call so
+    a supervisor can inject ``event_callback=...`` and friends.  ``_run_agent``
+    below is the thin oneshot wrapper that builds + runs + returns the text."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
@@ -384,7 +392,7 @@ def _run_agent(
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
-    agent = AIAgent(
+    agent_kwargs = dict(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
         provider=runtime.get("provider"),
@@ -408,6 +416,30 @@ def _run_agent(
         #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
         #   - skill secret capture → returns gracefully when no callback set
         clarify_callback=_oneshot_clarify_callback,
+    )
+    # A supervisor (e.g. the hermes-mcp workhorse server) merges in
+    # event_callback / streaming callbacks here to monitor + steer the run.
+    if agent_overrides:
+        agent_kwargs.update(agent_overrides)
+
+    return AIAgent(**agent_kwargs)
+
+
+def _run_agent(
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: object = None,
+    use_config_toolsets: bool = True,
+) -> tuple[str, dict]:
+    """Oneshot wrapper: build a wired agent, suppress interactive display,
+    run a single conversation, return ``(final_response, run_result)``."""
+    agent = build_oneshot_agent(
+        prompt,
+        model=model,
+        provider=provider,
+        toolsets=toolsets,
+        use_config_toolsets=use_config_toolsets,
     )
 
     # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
