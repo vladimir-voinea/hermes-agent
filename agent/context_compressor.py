@@ -1167,8 +1167,41 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
 
+    def calibrated_preflight(self, raw_tokens: int) -> int:
+        """Scale a rough preflight token estimate by the learned real/rough ratio.
+
+        ``estimate_*_tokens_rough`` uses a flat ~4 chars/token heuristic tuned for
+        English chat. Dense content (code, JSON, tool output) tokenizes far more
+        efficiently — GLM-5.2 runs ~6.5 chars/token, so the rough estimate reads
+        ~1.6x high, inflating the status display and firing compaction at ~45%
+        real usage instead of the configured threshold. This records the raw
+        estimate so ``update_from_response`` can refine the calibration from the
+        provider's real ``prompt_tokens``, and applies the learned factor. The
+        factor is clamped to (0.55, 1.0]: it can only *reduce* an over-count,
+        never inflate one, so it can never cause a context overflow.
+
+        Scoped to GLM only: GLM-5.2's ~6.5 chars/token on dense content is the
+        observed offender; other models keep the unmodified rough estimate.
+        """
+        if "glm" not in str(getattr(self, "model", "") or "").lower():
+            return int(raw_tokens)
+        self._last_raw_preflight_tokens = int(max(0, raw_tokens))
+        return int(raw_tokens * getattr(self, "_estimate_calibration", 1.0))
+
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
+        # Close the calibration loop: compare this turn's real prompt_tokens
+        # against the raw rough estimate that built the request (recorded by
+        # calibrated_preflight) and EMA-update the real/rough ratio.
+        _real_pt = usage.get("prompt_tokens", 0)
+        _raw_pt = getattr(self, "_last_raw_preflight_tokens", 0)
+        if _raw_pt > 0 and _real_pt > 0 and "glm" in str(getattr(self, "model", "") or "").lower():
+            _ratio = max(0.55, min(1.0, _real_pt / _raw_pt))
+            _cur = getattr(self, "_estimate_calibration", 1.0)
+            # Snap on the first real observation so the display + compaction
+            # threshold self-correct in one turn; EMA-smooth thereafter.
+            self._estimate_calibration = _ratio if _cur >= 0.999 else (0.65 * _cur + 0.35 * _ratio)
+            self._last_raw_preflight_tokens = 0
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
