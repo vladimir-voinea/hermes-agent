@@ -3231,3 +3231,31 @@
 .hermes-kanban-column-add {
   font-weight: 400 !important;
 }
+
+/* Always-visible primary create control */
+.hermes-kanban-new-task-btn {
+  appearance: none;
+  border: 1px solid #5e6ad2 !important;
+  background: #5e6ad2 !important;
+  color: #fff !important;
+  border-radius: 7px !important;
+  font-size: 12.5px !important;
+  font-weight: 560 !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+  padding: 0.38rem 0.75rem !important;
+  cursor: pointer;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+  line-height: 1.2;
+  white-space: nowrap;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.08) inset, 0 1px 2px rgba(0,0,0,0.2);
+}
+.hermes-kanban-new-task-btn:hover {
+  background: #6b76e0 !important;
+  border-color: #6b76e0 !important;
+}
+.hermes-kanban-column-add.is-open {
+  color: var(--color-foreground, #fff) !important;
+  background: color-mix(in srgb, #7170ff 18%, transparent) !important;
+  border-color: color-mix(in srgb, #7170ff 40%, transparent) !important;
+}

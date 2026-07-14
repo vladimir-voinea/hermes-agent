@@ -635,6 +635,7 @@
     const [draggingTaskId, setDraggingTaskId] = useState(null);
     const [density, setDensity] = useState(readDensity);
     const [focusedTaskId, setFocusedTaskId] = useState(null);
+    const [composeColumn, setComposeColumn] = useState(null); // which column's create panel is open
     const [showHelp, setShowHelp] = useState(false);
     const [drawerWidth, setDrawerWidth] = useState(readDrawerWidth);
     const searchInputRef = useRef(null);
@@ -1264,6 +1265,7 @@
         }
         if (key === "Escape") {
           if (selectedTaskId) { setSelectedTaskId(null); e.preventDefault(); return; }
+          if (composeColumn) { setComposeColumn(null); e.preventDefault(); return; }
           if (selectedIds.size) { setSelectedIds(new Set()); e.preventDefault(); return; }
           setFocusedTaskId(null);
           return;
@@ -1309,7 +1311,7 @@
         }
         if (key === "c" && !meta && !e.altKey) {
           e.preventDefault();
-          // Prefer focused card's column, else first column
+          // Prefer focused card's column, else Ready, else first active column
           let colName = null;
           if (focusedTaskId && filteredBoard) {
             for (const col of filteredBoard.columns) {
@@ -1318,11 +1320,8 @@
               }
             }
           }
-          if (!colName && filteredBoard && filteredBoard.columns[0]) colName = filteredBoard.columns[0].name;
-          if (colName) {
-            const btn = document.querySelector('.hermes-kanban-column[data-kanban-column="' + colName + '"] .hermes-kanban-column-add');
-            if (btn) btn.click();
-          }
+          if (!colName) colName = "ready";
+          setComposeColumn(colName);
           return;
         }
         if (key === "[" && !meta) { e.preventDefault(); cycleDensity(-1); return; }
@@ -1336,7 +1335,7 @@
       window.addEventListener("keydown", onKey);
       return function () { window.removeEventListener("keydown", onKey); };
     }, [
-      selectedTaskId, selectedIds, showHelp, focusedTaskId, filteredBoard,
+      selectedTaskId, selectedIds, showHelp, focusedTaskId, filteredBoard, composeColumn,
       focusTaskByOffset, focusInColumn, cycleDensity, loadBoard,
     ]);
 
@@ -1402,6 +1401,7 @@
           density, setDensity: setDensityPersist,
           searchInputRef: searchInputRef,
           onShowHelp: function () { setShowHelp(true); },
+          onNewTask: function () { setComposeColumn("ready"); },
           onNudgeDispatch: function () {
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
               .then(loadBoard)
@@ -1459,11 +1459,7 @@
               }, "Show completed"),
               h(Button, {
                 size: "sm",
-                onClick: function () {
-                  const btn = document.querySelector('.hermes-kanban-column[data-kanban-column="ready"] .hermes-kanban-column-add')
-                    || document.querySelector(".hermes-kanban-column-add");
-                  if (btn) btn.click();
-                },
+                onClick: function () { setComposeColumn("ready"); },
               }, "New task"),
             ),
           );
@@ -1475,6 +1471,8 @@
           failedIds,
           focusedTaskId,
           draggingTaskId,
+          composeColumn: composeColumn,
+          onCompose: setComposeColumn,
           onDragStart: handleDragStart,
           onDragEnd: handleDragEnd,
           toggleSelected,
@@ -2566,6 +2564,14 @@
         tx(t, "lanesByProfile", "Lanes"),
       ),
       h("div", { className: "hermes-kanban-toolbar-actions" },
+        h("button", {
+          type: "button",
+          className: "hermes-kanban-new-task-btn",
+          onClick: function () {
+            if (props.onNewTask) props.onNewTask();
+          },
+          title: "Create a new task in Ready (shortcut: C)",
+        }, "+ New task"),
         h("div", {
           className: "hermes-kanban-density",
           role: "group",
@@ -2912,6 +2918,13 @@
           failedIds: props.failedIds,
           focusedTaskId: props.focusedTaskId,
           draggingTaskId: props.draggingTaskId,
+          composeOpen: props.composeColumn === col.name,
+          onComposeOpen: function () {
+            if (props.onCompose) props.onCompose(col.name);
+          },
+          onComposeClose: function () {
+            if (props.onCompose) props.onCompose(null);
+          },
           toggleSelected: props.toggleSelected,
           toggleRange: props.toggleRange,
           selectAllInColumn: props.selectAllInColumn,
@@ -2940,8 +2953,8 @@
   function Column(props) {
     const { t } = useI18n();
     const [dragOver, setDragOver] = useState(false);
-    const [showCreate, setShowCreate] = useState(false);
     const [showAllHistory, setShowAllHistory] = useState(false);
+    const showCreate = !!props.composeOpen;
     const colRef = useRef(null);
 
     // Listen for our synthetic touch-drop events from attachTouchDrag().
@@ -3046,9 +3059,15 @@
           props.column.tasks.length),
         h("button", {
           type: "button",
-          className: "hermes-kanban-column-add",
+          className: "hermes-kanban-column-add" + (showCreate ? " is-open" : ""),
           title: tx(t, "createTask", "Create task in this column"),
-          onClick: function () { setShowCreate(function (v) { return !v; }); },
+          onClick: function () {
+            if (showCreate) {
+              if (props.onComposeClose) props.onComposeClose();
+            } else if (props.onComposeOpen) {
+              props.onComposeOpen();
+            }
+          },
         }, showCreate ? "×" : "+"),
       ),
       h("div", { className: "hermes-kanban-column-sub" },
@@ -3059,9 +3078,13 @@
         assignees: props.assignees || [],
         tenants: props.tenants || [],
         onSubmit: function (body) {
-          return props.onCreate(body).then(function () { setShowCreate(false); });
+          return props.onCreate(body).then(function () {
+            if (props.onComposeClose) props.onComposeClose();
+          });
         },
-        onCancel: function () { setShowCreate(false); },
+        onCancel: function () {
+          if (props.onComposeClose) props.onComposeClose();
+        },
       }) : null,
       h("div", { className: "hermes-kanban-column-body" },
         rawTasks.length === 0
