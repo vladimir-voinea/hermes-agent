@@ -606,7 +606,11 @@
     const [showDone, setShowDone] = useState(function () { return readBool(SHOW_DONE_KEY, false); });
     const [hideEmpty, setHideEmpty] = useState(function () { return readBool(HIDE_EMPTY_KEY, true); });
     const setShowDonePersist = useCallback(function (v) {
-      setShowDone(!!v); writeBool(SHOW_DONE_KEY, !!v);
+      // Coerce carefully: Checkbox may pass true/false; rail button passes boolean.
+      // Treat only explicit true as open — never stick open on truthy garbage.
+      const next = v === true || v === 1 || v === "1" || v === "true";
+      setShowDone(next);
+      writeBool(SHOW_DONE_KEY, next);
     }, []);
     const setHideEmptyPersist = useCallback(function (v) {
       setHideEmpty(!!v); writeBool(HIDE_EMPTY_KEY, !!v);
@@ -1419,12 +1423,40 @@
                 h(Button, { size: "sm", onClick: function () { setShowHelp(true); } }, "Keyboard shortcuts"),
               ),
             ) : null,
-        (!showDone && (historyCounts.done + historyCounts.archived) > 0)
-          ? h(HistoryRail, {
-              counts: historyCounts,
-              onShow: function () { setShowDonePersist(true); },
-            })
-          : null,
+        h(HistoryRail, {
+          counts: historyCounts,
+          open: showDone,
+          onToggle: setShowDonePersist,
+        }),
+        // When every active column is empty but history has work, surface that
+        // instead of a dead empty board.
+        (function () {
+          const activeEmpty = !viewBoard || !(viewBoard.columns || []).some(function (c) {
+            return HISTORY_COLUMNS.indexOf(c.name) < 0 && (c.tasks || []).length > 0;
+          });
+          const hist = (historyCounts.done || 0) + (historyCounts.archived || 0);
+          if (!activeEmpty || !hist || showDone) return null;
+          return h("div", { className: "hermes-kanban-board-empty hermes-kanban-board-empty--done" },
+            h("div", { className: "hermes-kanban-board-empty-title" },
+              "No active work"),
+            h("div", { className: "hermes-kanban-board-empty-hint" },
+              hist + " completed task" + (hist === 1 ? "" : "s") + " on this board. Active columns are empty."),
+            h("div", { className: "hermes-kanban-board-empty-actions" },
+              h(Button, {
+                size: "sm",
+                onClick: function () { setShowDonePersist(true); },
+              }, "Show completed"),
+              h(Button, {
+                size: "sm",
+                onClick: function () {
+                  const btn = document.querySelector('.hermes-kanban-column[data-kanban-column="ready"] .hermes-kanban-column-add')
+                    || document.querySelector(".hermes-kanban-column-add");
+                  if (btn) btn.click();
+                },
+              }, "New task"),
+            ),
+          );
+        })(),
         h(BoardColumns, {
           board: viewBoard || filteredBoard,
           laneByProfile,
@@ -2420,7 +2452,10 @@
     const c = props.counts || { done: 0, archived: 0 };
     const total = (c.done || 0) + (c.archived || 0);
     if (!total) return null;
-    return h("div", { className: "hermes-kanban-history-rail" },
+    const open = !!props.open;
+    return h("div", {
+      className: "hermes-kanban-history-rail" + (open ? " hermes-kanban-history-rail--open" : ""),
+    },
       h("div", { className: "hermes-kanban-history-rail-text" },
         h("span", { className: "hermes-kanban-history-rail-label" }, "Completed"),
         h("span", { className: "hermes-kanban-history-rail-meta" },
@@ -2428,10 +2463,17 @@
       ),
       h("button", {
         type: "button",
-        className: "hermes-kanban-history-rail-btn",
-        onClick: props.onShow,
-        title: "Show Done and Archived as columns",
-      }, "Show history"),
+        className: "hermes-kanban-history-rail-btn" + (open ? " is-active" : ""),
+        onClick: function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (props.onToggle) props.onToggle(!open);
+        },
+        title: open
+          ? "Hide Done and Archived columns"
+          : "Show Done and Archived as columns",
+        "aria-pressed": open ? "true" : "false",
+      }, open ? "Hide history" : "Show history"),
     );
   }
 
@@ -2485,26 +2527,12 @@
         ),
       ),
       h("label", { className: "flex items-center gap-2 text-xs hermes-kanban-toolbar-check",
-                   title: "Show Done + Archived as full columns. Hidden by default — completed work is a history rail, not a swimlane." },
-        h(Checkbox, {
-          checked: !!props.showDone,
-          onCheckedChange: function (checked) {
-            if (props.setShowDone) props.setShowDone(checked === true);
-          },
-        }),
-        "Done/Archived",
-        (props.historyCounts && (props.historyCounts.done + props.historyCounts.archived) > 0)
-          ? h("span", { className: "hermes-kanban-toolbar-count" },
-              String(props.historyCounts.done + props.historyCounts.archived))
-          : null,
-      ),
-      h("label", { className: "flex items-center gap-2 text-xs hermes-kanban-toolbar-check",
-                   title: "Also load archived tasks from the database into Done/Archived." },
+                   title: "Also load archived tasks from the database (then use Show history)." },
         h(Checkbox, {
           checked: props.includeArchived,
           onCheckedChange: function (checked) { props.setIncludeArchived(checked === true); },
         }),
-        tx(t, "showArchived", "Load archived"),
+        "Load archived",
       ),
       h("label", { className: "flex items-center gap-2 text-xs hermes-kanban-toolbar-check",
                    title: "Hide empty optional columns (triage/scheduled when empty)." },
@@ -2882,11 +2910,15 @@
           allTasks: props.allTasks,
         });
       }),
-      h(TrashDropZone, {
-        draggingTaskId: props.draggingTaskId,
-        selectedIds: props.selectedIds,
-        onDelete: props.onDelete,
-      }),
+      // Only show trash while a drag is active — otherwise it steals a grid
+      // cell and looks like a permanent "delete" column.
+      props.draggingTaskId
+        ? h(TrashDropZone, {
+            draggingTaskId: props.draggingTaskId,
+            selectedIds: props.selectedIds,
+            onDelete: props.onDelete,
+          })
+        : null,
     );
   }
 

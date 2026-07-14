@@ -2384,3 +2384,24 @@
     max-height: 22rem !important;
   }
 }
+
+/* History rail open state + hide control */
+.hermes-kanban-history-rail--open {
+  border-color: var(--hk-accent-border);
+  background: color-mix(in srgb, var(--hk-accent) 8%, var(--hk-surface-1));
+}
+.hermes-kanban-history-rail-btn.is-active {
+  color: var(--hk-text);
+  border-color: var(--hk-accent-border);
+  background: var(--hk-accent-soft);
+}
+.hermes-kanban-board-empty--done {
+  padding: 1.25rem 1rem;
+  margin-bottom: 0.25rem;
+}
+/* Trash: don't reserve a permanent grid hole */
+.hermes-kanban-trash {
+  grid-column: 1 / -1;
+  max-height: 3.5rem !important;
+  min-height: 3rem !important;
+}
