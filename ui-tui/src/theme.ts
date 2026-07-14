@@ -346,6 +346,52 @@ export const LIGHT_THEME: Theme = {
   bannerHero: ''
 }
 
+// ── v2 / opencode palette (--tui2) ───────────────────────────────────
+// A restrained, neutral slate base with a single cool accent — the calm,
+// low-chroma look of opencode, replacing the gold/amber Hermes default.
+// Same shape as DARK_THEME so `fromSkin` still layers cleanly.
+export const OPENCODE_THEME: Theme = {
+  color: {
+    primary: '#c0caf5',
+    accent: '#7aa2f7',
+    border: '#2a2e3a',
+    text: '#c0c5ce',
+    muted: '#6b7089',
+    completionBg: '#16161e',
+    completionCurrentBg: '#283457',
+    completionMetaBg: '#16161e',
+    completionMetaCurrentBg: '#283457',
+
+    label: '#9aa5ce',
+    ok: '#9ece6a',
+    error: '#f7768e',
+    warn: '#e0af68',
+
+    prompt: '#7aa2f7',
+    sessionLabel: '#565f89',
+    sessionBorder: '#565f89',
+
+    statusBg: '#16161e',
+    statusFg: '#787c99',
+    statusGood: '#9ece6a',
+    statusWarn: '#e0af68',
+    statusBad: '#ff9e64',
+    statusCritical: '#f7768e',
+    selectionBg: '#283457',
+
+    diffAdded: 'rgb(200,240,205)',
+    diffRemoved: 'rgb(245,205,215)',
+    diffAddedWord: 'rgb(115,205,120)',
+    diffRemovedWord: 'rgb(247,118,142)',
+    shellDollar: '#7dcfff'
+  },
+
+  brand: BRAND,
+
+  bannerLogo: '',
+  bannerHero: ''
+}
+
 const TRUE_RE = /^(?:1|true|yes|on)$/
 const FALSE_RE = /^(?:0|false|no|off)$/
 
@@ -502,11 +548,16 @@ export function normalizeThemeForAnsiLightTerminal(
 
 const DEFAULT_LIGHT_MODE = detectLightMode()
 
-export const DEFAULT_THEME: Theme = normalizeThemeForAnsiLightTerminal(
-  DEFAULT_LIGHT_MODE ? LIGHT_THEME : DARK_THEME,
-  process.env,
-  DEFAULT_LIGHT_MODE
-)
+// --tui2 (HERMES_TUI_VARIANT=2) boots on the neutral opencode palette. The env
+// is set only by the v2 launcher, so the classic --tui default is unaffected.
+export const DEFAULT_THEME: Theme =
+  process.env.HERMES_TUI_VARIANT === '2'
+    ? OPENCODE_THEME
+    : normalizeThemeForAnsiLightTerminal(
+        DEFAULT_LIGHT_MODE ? LIGHT_THEME : DARK_THEME,
+        process.env,
+        DEFAULT_LIGHT_MODE
+      )
 
 // ── Skin → Theme ─────────────────────────────────────────────────────
 

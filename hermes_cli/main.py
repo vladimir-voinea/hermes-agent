@@ -2013,13 +2013,22 @@ def _launch_tui(
     pass_session_id: bool = False,
     max_turns: Optional[int] = None,
     accept_hooks: bool = False,
+    variant: int = 1,
 ):
-    """Replace current process with the TUI."""
+    """Replace current process with the TUI.
+
+    ``variant=2`` (``--tui2``) launches the same bundle with
+    ``HERMES_TUI_VARIANT=2`` set, which selects the experimental v2 view
+    (opencode-style flat transcript) in ``ui-tui/src/entry.tsx``. The default
+    ``--tui`` path is unaffected.
+    """
     tui_dir = PROJECT_ROOT / "ui-tui"
 
     import tempfile
 
     env = os.environ.copy()
+    if variant == 2:
+        env["HERMES_TUI_VARIANT"] = "2"
     try:
         from hermes_cli.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
@@ -2228,7 +2237,12 @@ def _resolve_use_tui(args) -> bool:
     """
     if getattr(args, "cli", False):
         return False
+    if getattr(args, "repl2", False):
+        # --repl2 is the classic REPL with the flat opencode skin.
+        return False
     if getattr(args, "tui", False):
+        return True
+    if getattr(args, "tui2", False):
         return True
     try:
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -2249,6 +2263,11 @@ def _resolve_use_tui(args) -> bool:
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
+
+    # --repl2: classic REPL rendered with the flat opencode skin. The env is
+    # read by hermes_cli.skin_engine.get_active_skin() to force the skin.
+    if getattr(args, "repl2", False):
+        os.environ["HERMES_REPL_VARIANT"] = "2"
 
     _apply_safe_mode(args)
 
@@ -2403,6 +2422,7 @@ def cmd_chat(args):
             pass_session_id=getattr(args, "pass_session_id", False),
             max_turns=getattr(args, "max_turns", None),
             accept_hooks=getattr(args, "accept_hooks", False),
+            variant=2 if getattr(args, "tui2", False) else 1,
         )
 
     # Import and run the CLI

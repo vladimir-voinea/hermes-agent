@@ -2387,6 +2387,16 @@ def _accent_hex() -> str:
         return "#FFBF00"
 
 
+def _repl_v2() -> bool:
+    """True when --repl2 (flat opencode REPL) is active."""
+    return os.environ.get("HERMES_REPL_VARIANT") == "2"
+
+
+def _user_glyph() -> str:
+    """User-message marker: flat prompt caret in v2, classic bullet otherwise."""
+    return "❯" if _repl_v2() else "●"
+
+
 def _rich_text_from_ansi(text: str) -> _RichText:
     """Safely render assistant/tool output that may contain ANSI escapes.
 
@@ -5503,7 +5513,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         )
         lines = user_input.split("\n")
         if len(lines) <= 1:
-            return f"[bold {_accent_hex()}]●[/] [bold]{_escape(user_input)}[/]{ts_suffix}"
+            return f"[bold {_accent_hex()}]{_user_glyph()}[/] [bold]{_escape(user_input)}[/]{ts_suffix}"
 
         first_lines = int(getattr(self, "user_message_preview_first_lines", 2))
         last_lines = int(getattr(self, "user_message_preview_last_lines", 2))
@@ -5520,7 +5530,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             tail = []
 
         preview_lines = [
-            f"[bold {_accent_hex()}]●[/] [bold]{_escape(head[0])}[/]{ts_suffix}"
+            f"[bold {_accent_hex()}]{_user_glyph()}[/] [bold]{_escape(head[0])}[/]{ts_suffix}"
         ]
         preview_lines.extend(f"[bold]{_escape(line)}[/]" for line in head[1:])
 
@@ -5552,12 +5562,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
     def _print_user_message_preview(self, user_input: str) -> None:
         """Render a user message using the normal chat scrollback style."""
-        ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+        if _repl_v2():
+            # Flat: a blank line of turn-air instead of a rule, then a caret.
+            ChatConsole().print("")
+        else:
+            ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
         text = str(user_input or "")
         if "\n" in text:
             ChatConsole().print(self._format_submitted_user_message_preview(text))
         else:
-            ChatConsole().print(f"[bold {_accent_hex()}]●[/] [bold]{_escape(text)}[/]")
+            ChatConsole().print(f"[bold {_accent_hex()}]{_user_glyph()}[/] [bold]{_escape(text)}[/]")
 
     def _stream_reasoning_delta(self, text: str) -> None:
         """Stream reasoning/thinking tokens into a dim box above the response.
@@ -5579,20 +5593,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Open reasoning box on first reasoning token
         if not getattr(self, "_reasoning_box_opened", False):
             self._reasoning_box_opened = True
-            w = self._scrollback_box_width()
-            r_label = " Reasoning "
-            r_fill = w - 2 - len(r_label)
-            _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
+            if _repl_v2():
+                # Flat: no reasoning box — dim-italic lines, indented.
+                _cprint("")
+            else:
+                w = self._scrollback_box_width()
+                r_label = " Reasoning "
+                r_fill = w - 2 - len(r_label)
+                _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
 
         self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
+        _rpad = _STREAM_PAD if _repl_v2() else ""
 
         # Emit complete lines, and force-flush long partial lines so
         # reasoning is visible in real-time even without newlines.
         while "\n" in self._reasoning_buf:
             line, self._reasoning_buf = self._reasoning_buf.split("\n", 1)
-            _cprint(f"{_DIM}{line}{_RST}")
+            _cprint(f"{_rpad}{_DIM}{line}{_RST}")
         if len(self._reasoning_buf) > 80:
-            _cprint(f"{_DIM}{self._reasoning_buf}{_RST}")
+            _cprint(f"{_rpad}{_DIM}{self._reasoning_buf}{_RST}")
             self._reasoning_buf = ""
 
     def _close_reasoning_box(self) -> None:
@@ -5601,10 +5620,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Flush remaining reasoning buffer
             buf = getattr(self, "_reasoning_buf", "")
             if buf:
-                _cprint(f"{_DIM}{buf}{_RST}")
+                _cprint(f"{_STREAM_PAD if _repl_v2() else ''}{_DIM}{buf}{_RST}")
                 self._reasoning_buf = ""
-            w = self._scrollback_box_width()
-            _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
+            if not _repl_v2():
+                w = self._scrollback_box_width()
+                _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
             self._reasoning_box_opened = False
 
             # Flush any content that was deferred while reasoning was rendering.
@@ -5800,9 +5820,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self._stream_text_ansi = ""
             if self.show_timestamps:
                 label = f"{label} {datetime.now().strftime(getattr(self, 'timestamp_format', '%H:%M'))}"
-            w = self._scrollback_box_width()
-            fill = w - 2 - HermesCLI._status_bar_display_width(label)
-            _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+            if _repl_v2():
+                # Flat: no box header — the response simply flows, indented,
+                # after a single blank line of separation.
+                _cprint("")
+            else:
+                w = self._scrollback_box_width()
+                fill = w - 2 - HermesCLI._status_bar_display_width(label)
+                _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
 
         self._stream_buf += text
 
@@ -5926,8 +5951,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
             self._stream_buf = ""
 
-        # Close the response box
-        if self._stream_box_opened:
+        # Close the response box (flat v2 has no box to close)
+        if self._stream_box_opened and not _repl_v2():
             w = self._scrollback_box_width()
             _cprint(f"{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
 
@@ -6159,6 +6184,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # logged at DEBUG by the advisory module.
             pass
 
+    def _show_v2_banner(self) -> None:
+        """Minimal flat banner for --repl2 — one quiet line, no ASCII, no box."""
+        from hermes_cli.skin_engine import get_active_skin
+        s = get_active_skin()
+        acc = s.get_color("ui_accent", "#7aa2f7")
+        dim = s.get_color("banner_dim", "#6b7089")
+        faint = s.get_color("session_border", "#2a2e3a")
+        name = s.get_branding("agent_name", "hermes")
+        model = getattr(self, "model", "") or ""
+        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+        home = os.path.expanduser("~")
+        if cwd.startswith(home):
+            cwd = "~" + cwd[len(home):]
+        sep = f"[{faint}]  ·  [/]"
+        ChatConsole().print(
+            f"[{faint}]⚕[/] [bold {acc}]{name}[/]{sep}[{dim}]{model}[/]{sep}[{dim}]{cwd}[/]"
+        )
+        welcome = s.get_branding("welcome", "Type your message or /help for commands.")
+        ChatConsole().print(f"[{dim}]{welcome}[/]")
+
     def show_banner(self):
         """Display the welcome banner in Claude Code style."""
         self.console.clear()
@@ -6171,7 +6216,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         term_width = shutil.get_terminal_size().columns
         use_compact = self.compact or term_width < 80
         
-        if use_compact:
+        if _repl_v2():
+            self._show_v2_banner()
+        elif use_compact:
             self._console_print(_build_compact_banner())
             self._show_status()
         else:
@@ -10933,9 +10980,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Close a previous tool's live-args box before announcing the next tool.
         self._close_tool_args_box()
 
-        from agent.display import get_tool_emoji
-        emoji = get_tool_emoji(tool_name, default="⚡")
-        _cprint(f"  ┊ {emoji} preparing {tool_name}…")
+        if _repl_v2():
+            # Flat: a dim caret-gutter row, no emoji, no ┊ pipe. Indented to
+            # _STREAM_PAD so it aligns with the response / reasoning content.
+            _cprint(f"{_STREAM_PAD}{_DIM}› {tool_name}…{_RST}")
+        else:
+            from agent.display import get_tool_emoji
+            emoji = get_tool_emoji(tool_name, default="⚡")
+            _cprint(f"  ┊ {emoji} preparing {tool_name}…")
 
     # ====================================================================
     # Live tool-argument streaming (real-time write_file content, etc.)
@@ -12534,8 +12586,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _voice_prefix = ""
             if self._voice_mode and isinstance(message, str):
                 _voice_prefix = (
-                    "[Voice input — respond concisely and conversationally, "
-                    "2-3 sentences max. No code blocks or markdown.] "
+                    "[Voice input — do the task exactly as you normally would: use tools, "
+                    "run commands, edit files, and reason through as many steps as it takes. "
+                    "This only shapes your final spoken reply, which will be read aloud by "
+                    "text-to-speech — so write that reply for the ear, not the screen: plain "
+                    "spoken language, no markdown, code blocks, bullet lists, tables, URLs, or "
+                    "symbols to be read out. If you did work, say what you did and how it turned "
+                    "out rather than pasting it. Let the length fit the content — a word or two "
+                    "when that's the answer, a few sentences when more is genuinely needed — but "
+                    "stay tight and skip filler.] "
                 )
 
             def run_agent():

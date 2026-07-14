@@ -258,7 +258,10 @@ const TranscriptPane = memo(function TranscriptPane({
   )
 })
 
-const ComposerPane = memo(function ComposerPane({
+// Exported (additive; no behavior change) so the v2 view (AppLayout2) can
+// reuse the composer/overlay/status panes verbatim and only swap the
+// transcript renderer.
+export const ComposerPane = memo(function ComposerPane({
   actions,
   composer,
   status
@@ -430,7 +433,7 @@ const ComposerPane = memo(function ComposerPane({
   )
 })
 
-const AgentsOverlayPane = memo(function AgentsOverlayPane() {
+export const AgentsOverlayPane = memo(function AgentsOverlayPane() {
   const { gw } = useGateway()
   const ui = useStore($uiState)
   const overlay = useStore($overlayState)
@@ -445,14 +448,14 @@ const AgentsOverlayPane = memo(function AgentsOverlayPane() {
   )
 })
 
-const JourneyPane = memo(function JourneyPane() {
+export const JourneyPane = memo(function JourneyPane() {
   const { gw } = useGateway()
   const ui = useStore($uiState)
 
   return <Journey gw={gw} onClose={() => patchOverlayState({ journey: false })} t={ui.theme} />
 })
 
-const StatusRulePane = memo(function StatusRulePane({
+export const StatusRulePane = memo(function StatusRulePane({
   at,
   composer,
   status

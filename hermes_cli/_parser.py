@@ -241,6 +241,20 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--tui2",
+        action="store_true",
+        default=False,
+        help="Launch the experimental v2 TUI (opencode-style flat view)",
+    )
+    _inherited_flag(
+        parser,
+        "--repl2",
+        action="store_true",
+        default=False,
+        help="Launch the classic REPL with the flat opencode skin (v2)",
+    )
+    _inherited_flag(
+        parser,
         "--cli",
         action="store_true",
         default=False,
@@ -403,6 +417,20 @@ def build_top_level_parser():
         action="store_true",
         default=False,
         help="Launch the modern TUI instead of the classic REPL",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--tui2",
+        action="store_true",
+        default=False,
+        help="Launch the experimental v2 TUI (opencode-style flat view)",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--repl2",
+        action="store_true",
+        default=False,
+        help="Launch the classic REPL with the flat opencode skin (v2)",
     )
     _inherited_flag(
         chat_parser,
