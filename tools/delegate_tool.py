@@ -179,6 +179,46 @@ def _unregister_subagent(subagent_id: str) -> None:
         _active_subagents.pop(subagent_id, None)
 
 
+def _preregister_queued(children: List[Any]) -> None:
+    """Register freshly-built children as ``queued`` BEFORE the daemon executor
+    picks them up.
+
+    Without this there is a blind window: children are built on the caller
+    thread and the background handle returns immediately, but each child only
+    lands in ``_active_subagents`` later, inside ``_run_single_child`` on the
+    executor thread. An orchestrator that polls ``subagent_status`` in that gap
+    sees ``count: 0`` and wrongly concludes the swarm already finished (the
+    exact "steering was skipped" failure). Pre-registering as ``queued`` closes
+    the window; ``_run_single_child`` overwrites the same sid with the live
+    ``running`` record, and its ``finally`` unregisters on completion.
+
+    ``children`` is the ``[(index, task, child_agent), ...]`` list.
+    """
+    now = time.time()
+    for _i, _t, _child in children:
+        sid = getattr(_child, "_subagent_id", None)
+        if not isinstance(sid, str):
+            continue
+        raw_depth = getattr(_child, "_delegate_depth", 1)
+        depth = max(0, raw_depth - 1) if isinstance(raw_depth, int) else 0
+        parent_sid = getattr(_child, "_parent_subagent_id", None)
+        _register_subagent(
+            {
+                "subagent_id": sid,
+                "parent_id": parent_sid if isinstance(parent_sid, str) else None,
+                "depth": depth,
+                "goal": (_t or {}).get("goal") if isinstance(_t, dict) else None,
+                "model": getattr(_child, "model", None)
+                if isinstance(getattr(_child, "model", None), str)
+                else None,
+                "started_at": now,
+                "status": "queued",
+                "tool_count": 0,
+                "agent": _child,
+            }
+        )
+
+
 def interrupt_subagent(subagent_id: str) -> bool:
     """Request that a single running subagent stop at its next iteration boundary.
 
@@ -200,6 +240,163 @@ def interrupt_subagent(subagent_id: str) -> bool:
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
         return False
     return True
+
+
+def steer_subagent(subagent_id: str, text: str) -> bool:
+    """Inject a steering message into a RUNNING subagent without stopping it.
+
+    The steer-mode sibling of :func:`interrupt_subagent`. Where interrupt
+    halts the child at its next iteration boundary, this stashes ``text`` in
+    the child's ``_pending_steer`` slot via ``AIAgent.steer()``. The child
+    keeps running; the text surfaces in its next tool result / pre-API drain,
+    so it adjusts course mid-flight (see AIAgent.steer). Returns True only if
+    a matching running subagent was found AND accepted the (non-empty) steer.
+    """
+    if not text or not str(text).strip():
+        return False
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+    if not record:
+        return False
+    agent = record.get("agent")
+    if agent is None:
+        return False
+    try:
+        return bool(agent.steer(str(text)))
+    except Exception as exc:
+        logger.debug("steer_subagent(%s) failed: %s", subagent_id, exc)
+        return False
+
+
+def subagent_status(
+    subagent_id: Optional[str] = None,
+    *,
+    tail_entries: int = 6,
+    wait_secs: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """Live, enriched snapshot of running subagents — the swarm 'sensor'.
+
+    Unlike :func:`list_active_subagents` (shallow metadata only), each entry
+    here carries a tail of the child's recent tool calls/outputs pulled from
+    its live ``_session_messages``, so an orchestrator (human via RPC, or the
+    model via the registered tool) can SEE what each worker is doing before
+    deciding whether to :func:`steer_subagent` it.
+
+    Args:
+        subagent_id: Restrict to one child; omit to snapshot all.
+        tail_entries: How many recent tool results to include per child.
+        wait_secs: Optionally block up to this many seconds before snapshotting
+            (bounded to [0, 30]) so a poll loop can pace itself without a
+            separate sleep tool. Returns early once no children remain.
+
+    Each entry: {subagent_id, parent_id, depth, goal, model, status,
+    tool_count, running_secs, output_tail:[{tool,preview,is_error}], last_error}.
+    """
+    # Bounded, cooperative wait so the model can pace polls. Poll every 0.5s so
+    # a batch that finishes fast doesn't burn the whole budget.
+    budget = max(0.0, min(float(wait_secs or 0.0), 30.0))
+    if budget:
+        # The pacer runs on the orchestrator's tool thread, so a soft interrupt
+        # (ESC / single Ctrl+C) flags THIS thread. Check it every tick and bail
+        # immediately — otherwise a "stop polling" interrupt would be stuck
+        # behind up to `budget` seconds of sleep, which is exactly the "it's
+        # polling and won't respond" failure mode. Steer lands at the boundary
+        # after this returns; interrupt breaks out mid-wait, right here.
+        try:
+            from tools.interrupt import is_interrupted as _is_interrupted
+        except Exception:  # pragma: no cover - defensive
+            _is_interrupted = lambda: False  # noqa: E731
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            if _is_interrupted():
+                break
+            with _active_subagents_lock:
+                still_running = bool(_active_subagents)
+            if not still_running:
+                break
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+    now = time.time()
+    with _active_subagents_lock:
+        records = list(_active_subagents.values())
+
+    out: List[Dict[str, Any]] = []
+    for r in records:
+        sid = r.get("subagent_id")
+        if subagent_id and sid != subagent_id:
+            continue
+        agent = r.get("agent")
+        tail: List[Dict[str, Any]] = []
+        try:
+            msgs = getattr(agent, "_session_messages", None) or []
+            tail = _extract_output_tail({"messages": msgs}, max_entries=tail_entries)
+        except Exception:
+            tail = []
+        last_error = None
+        for entry in reversed(tail):
+            if entry.get("is_error"):
+                last_error = entry.get("preview")
+                break
+        started = r.get("started_at")
+        # Live activity — moves DURING generation, before the first tool call,
+        # so a slow worker (heavy prefill, long paragraph before write_file)
+        # reads as "working" instead of a dead `tools: 0`. Pulled from the
+        # child's own get_activity_summary(); degrades gracefully.
+        activity: Dict[str, Any] = {}
+        try:
+            if agent is not None and hasattr(agent, "get_activity_summary"):
+                s = agent.get_activity_summary() or {}
+                api = s.get("api_call_count")
+                cur = s.get("current_tool")
+                used = s.get("budget_used")
+                mx = s.get("budget_max")
+                phase = (
+                    f"in_tool:{cur}" if cur
+                    else ("generating" if (api or 0) > 0 else "starting")
+                )
+                activity = {
+                    "phase": phase,
+                    "api_calls": api,
+                    "current_tool": cur,
+                    "secs_since_activity": s.get("seconds_since_activity"),
+                    "budget_used": used,
+                    "budget_max": mx,
+                    "budget_pct": (
+                        round(100 * used / mx) if isinstance(used, int)
+                        and isinstance(mx, int) and mx > 0 else None
+                    ),
+                }
+        except Exception:
+            activity = {}
+        # Prefer a live tool count derived from the transcript tail when the
+        # record's callback-driven counter hasn't advanced (it lags for
+        # background children); fall back to the record value.
+        live_tools = r.get("tool_count") or 0
+        try:
+            _tail_tools = sum(1 for e in tail if e.get("tool"))
+            live_tools = max(live_tools, _tail_tools)
+        except Exception:
+            pass
+        out.append(
+            {
+                "subagent_id": sid,
+                "parent_id": r.get("parent_id"),
+                "depth": r.get("depth"),
+                "goal": r.get("goal"),
+                "model": r.get("model"),
+                "status": r.get("status"),
+                "tool_count": live_tools,
+                "running_secs": (
+                    round(now - started, 1)
+                    if isinstance(started, (int, float))
+                    else None
+                ),
+                "activity": activity,
+                "output_tail": tail,
+                "last_error": last_error,
+            }
+        )
+    return out
 
 
 def list_active_subagents() -> List[Dict[str, Any]]:
@@ -2876,36 +3073,77 @@ def delegate_task(
                     pass
 
         _goals = [t["goal"] for t in task_list]
-        dispatch = dispatch_async_delegation_batch(
-            goals=_goals,
-            context=context,
-            # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
-            role=top_role,
-            model=creds["model"],
-            session_key=_session_key,
-            origin_ui_session_id=_origin_ui_session_id,
-            parent_session_id=_parent_session_id,
-            runner=_batch_runner,
-            interrupt_fn=_batch_interrupt,
-            max_async_children=_get_max_async_children(),
-        )
+        # Close the registration blind window: mark children visible as
+        # `queued` before the daemon executor starts them, so an orchestrator
+        # polling subagent_status right after dispatch sees them running
+        # instead of a false count:0. _run_single_child upgrades each to
+        # `running` and unregisters on completion (same sid).
+        _preregister_queued(children)
+        try:
+            dispatch = dispatch_async_delegation_batch(
+                goals=_goals,
+                context=context,
+                # Metadata for the completion block only; subagents inherit the
+                # parent's toolsets (no model-facing toolsets arg).
+                toolsets=None,
+                role=top_role,
+                model=creds["model"],
+                session_key=_session_key,
+                origin_ui_session_id=_origin_ui_session_id,
+                parent_session_id=_parent_session_id,
+                runner=_batch_runner,
+                interrupt_fn=_batch_interrupt,
+                max_async_children=_get_max_async_children(),
+            )
+        except Exception:
+            # Scheduling itself failed, so neither the executor runner nor the
+            # sync fallback will run _run_single_child to clean up — drop the
+            # queued placeholders so subagent_status doesn't show phantoms.
+            for _i, _t, _child in children:
+                _sid = getattr(_child, "_subagent_id", None)
+                if isinstance(_sid, str):
+                    _unregister_subagent(_sid)
+            raise
 
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
-            note = (
-                "Subagent is running in the background. You and the user can "
-                "keep working; its full result re-enters the conversation as a "
-                "new message when it finishes. Do not wait or poll — just "
-                "continue."
-                if n == 1 else
-                f"{n} subagents are running in parallel in the background. You "
-                f"and the user can keep working; they wait on each other and "
-                f"their consolidated results re-enter the conversation as a "
-                f"single message once ALL of them finish. Do not wait or poll "
-                f"— just continue."
-            )
+            # Supervision mode (delegation.supervise: true) flips the guidance:
+            # instead of "fire and forget, don't poll", it invites the
+            # orchestrator to observe with subagent_status and correct drift
+            # with steer_subagent. Default stays lean (no busy-waiting) so
+            # non-swarm delegations are unchanged.
+            _supervise = bool(cfg.get("supervise", False))
+            if _supervise:
+                _one_or_many = (
+                    "The subagent is running in the background"
+                    if n == 1 else
+                    f"{n} subagents are running in parallel in the background"
+                )
+                note = (
+                    f"{_one_or_many}; results re-enter the conversation "
+                    "automatically when done, so you never have to block. To "
+                    "SUPERVISE, call subagent_status (use wait_secs ~5-10 to "
+                    "pace, not busy-wait) to see what each worker is doing, and "
+                    "steer_subagent to correct one that drifts. Supervise, "
+                    "don't micromanage; if all workers look on-track, just let "
+                    "them finish. Interrupting or steering YOU does not stop the "
+                    "workers — only stopping the whole session does."
+                )
+            else:
+                note = (
+                    "Subagent is running in the background. You and the user can "
+                    "keep working; its full result re-enters the conversation as a "
+                    "new message when it finishes. No need to busy-wait; if you "
+                    "want to check on or redirect it, subagent_status and "
+                    "steer_subagent are available."
+                    if n == 1 else
+                    f"{n} subagents are running in parallel in the background. You "
+                    f"and the user can keep working; they wait on each other and "
+                    f"their consolidated results re-enter the conversation as a "
+                    f"single message once ALL of them finish. No need to "
+                    f"busy-wait; subagent_status and steer_subagent are available "
+                    f"if you want to observe or redirect a worker."
+                )
             payload = {
                 "status": "dispatched",
                 "mode": "background",
@@ -3254,8 +3492,9 @@ def _build_top_level_description() -> str:
         "you and the user keep working, and each subagent's full result "
         "re-enters the conversation as its own new message when it finishes. A "
         "batch is just N independent background subagents (N handles, each "
-        "completes on its own). Do NOT wait or poll; just continue with other "
-        "work after dispatching.\n\n"
+        "completes on its own). You don't need to busy-wait — but you MAY "
+        "supervise: subagent_status shows what each worker is doing and "
+        "steer_subagent redirects one mid-flight without stopping it.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -3511,4 +3750,120 @@ registry.register(
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
+)
+
+
+# --- Swarm supervision: sensor (subagent_status) + actuator (steer_subagent) ---
+# These give the MODEL orchestrator the same eyes+hands the human has via the
+# TUI overlay / gateway RPC. They only see children that are running in the
+# background (the top-level delegate_task path always backgrounds), so the
+# orchestrator's turn keeps going while workers run and it can poll + steer.
+
+SUBAGENT_STATUS_SCHEMA = {
+    "name": "subagent_status",
+    "description": (
+        "Observe your running background subagents: their goal, how long "
+        "they've run, and a tail of each one's recent tool calls/outputs "
+        "(with error flags) so you can tell what each worker is actually "
+        "doing. Use this to decide whether a worker is on-track or needs a "
+        "steer_subagent nudge. Pass wait_secs to block briefly (paced poll) "
+        "instead of spinning — it returns early once all workers finish."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "subagent_id": {
+                "type": "string",
+                "description": (
+                    "Restrict to one subagent by id. Omit to see all "
+                    "currently-running workers."
+                ),
+            },
+            "wait_secs": {
+                "type": "number",
+                "description": (
+                    "Block up to this many seconds (0-30) before returning the "
+                    "snapshot, so a supervise loop paces itself. Returns early "
+                    "when no workers remain. Use ~5-10s between polls."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
+STEER_SUBAGENT_SCHEMA = {
+    "name": "steer_subagent",
+    "description": (
+        "Send mid-flight guidance to a RUNNING subagent WITHOUT stopping it. "
+        "The worker sees your text as its next tool result and adjusts course "
+        "— use it to correct a worker drifting off-track, add a constraint, or "
+        "redirect, based on what subagent_status showed. Returns steered:false "
+        "if the worker already finished or the id is unknown."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "subagent_id": {
+                "type": "string",
+                "description": "Id of the running subagent to steer (from subagent_status).",
+            },
+            "text": {
+                "type": "string",
+                "description": (
+                    "The guidance to inject. Be concrete and self-contained; "
+                    "the worker reads it as tool output on its next step."
+                ),
+            },
+        },
+        "required": ["subagent_id", "text"],
+    },
+}
+
+
+def _handle_subagent_status(args: dict, **kw) -> str:
+    entries = subagent_status(
+        subagent_id=(args.get("subagent_id") or None),
+        wait_secs=float(args.get("wait_secs") or 0.0),
+    )
+    return json.dumps({"count": len(entries), "subagents": entries}, default=str)
+
+
+def _handle_steer_subagent(args: dict, **kw) -> str:
+    sid = str(args.get("subagent_id") or "").strip()
+    text = str(args.get("text") or "").strip()
+    if not sid:
+        return tool_error("steer_subagent requires 'subagent_id'.")
+    if not text:
+        return tool_error("steer_subagent requires non-empty 'text'.")
+    steered = steer_subagent(sid, text)
+    return json.dumps(
+        {
+            "steered": steered,
+            "subagent_id": sid,
+            "note": (
+                "Guidance queued; worker will see it on its next step."
+                if steered
+                else "No running worker with that id (it may have finished)."
+            ),
+        }
+    )
+
+
+registry.register(
+    name="subagent_status",
+    toolset="delegation",
+    schema=SUBAGENT_STATUS_SCHEMA,
+    handler=_handle_subagent_status,
+    check_fn=check_delegate_requirements,
+    emoji="👁",
+)
+
+registry.register(
+    name="steer_subagent",
+    toolset="delegation",
+    schema=STEER_SUBAGENT_SCHEMA,
+    handler=_handle_steer_subagent,
+    check_fn=check_delegate_requirements,
+    emoji="🎯",
 )

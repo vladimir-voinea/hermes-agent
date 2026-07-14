@@ -8197,6 +8197,34 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
 
 
+@method("subagent.steer")
+def _(rid, params: dict) -> dict:
+    """Human-side steer of a running subagent — the steer-mode sibling of
+    subagent.interrupt. Injects mid-flight guidance without stopping the
+    worker (see tools.delegate_tool.steer_subagent)."""
+    from tools.delegate_tool import steer_subagent
+
+    subagent_id = str(params.get("subagent_id") or "").strip()
+    text = str(params.get("text") or "").strip()
+    if not subagent_id:
+        return _err(rid, 4000, "subagent_id required")
+    if not text:
+        return _err(rid, 4000, "text required")
+    ok = steer_subagent(subagent_id, text)
+    return _ok(rid, {"steered": ok, "subagent_id": subagent_id})
+
+
+@method("subagent.status")
+def _(rid, params: dict) -> dict:
+    """Human-side enriched sensor: running subagents + recent tool-output
+    tails, so a CLI/TUI client can render what each worker is doing."""
+    from tools.delegate_tool import subagent_status
+
+    subagent_id = str(params.get("subagent_id") or "").strip() or None
+    entries = subagent_status(subagent_id=subagent_id)
+    return _ok(rid, {"count": len(entries), "subagents": entries})
+
+
 # ── Spawn-tree snapshots: TUI-written, disk-persisted ────────────────
 # The TUI is the source of truth for subagent state (it assembles payloads
 # from the event stream).  On turn-complete it posts the final tree here;
