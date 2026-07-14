@@ -478,8 +478,21 @@ def get_board(
             col = t.status if t.status in columns else "todo"
             columns[col].append(d)
 
-        # Stable per-column ordering already applied by list_tasks
-        # (priority DESC, created_at ASC), keep as-is.
+        # Newest first within each column. Prefer completed_at for finished
+        # work, else created_at. Priority only breaks ties (display order is
+        # not claim order — the dispatcher has its own query).
+        def _recency(d: dict) -> int:
+            c = d.get("completed_at")
+            if isinstance(c, (int, float)) and c > 0:
+                return int(c)
+            cr = d.get("created_at")
+            return int(cr or 0)
+
+        for _name, _tasks in columns.items():
+            _tasks.sort(
+                key=lambda d: (_recency(d), int(d.get("priority") or 0)),
+                reverse=True,
+            )
 
         # List of known tenants for the UI filter dropdown.
         tenants = [

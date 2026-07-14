@@ -1163,6 +1163,22 @@
         return 50;
       };
       cols = cols.slice().sort(function (a, b) { return rank(a.name) - rank(b.name); });
+      // Newest first within every column. Prefer completed_at for done,
+      // otherwise created_at. Priority only breaks ties.
+      const recency = function (t) {
+        const c = Number(t && t.completed_at);
+        if (Number.isFinite(c) && c > 0) return c;
+        const cr = Number(t && t.created_at);
+        return Number.isFinite(cr) ? cr : 0;
+      };
+      cols = cols.map(function (col) {
+        const tasks = (col.tasks || []).slice().sort(function (a, b) {
+          const rb = recency(b) - recency(a);
+          if (rb !== 0) return rb;
+          return (Number(b.priority) || 0) - (Number(a.priority) || 0);
+        });
+        return Object.assign({}, col, { tasks: tasks });
+      });
       return Object.assign({}, filteredBoard, { columns: cols });
     }, [filteredBoard, showDone, hideEmpty]);
 
