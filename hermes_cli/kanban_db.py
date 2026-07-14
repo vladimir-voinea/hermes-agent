@@ -253,6 +253,42 @@ def _resolve_crash_grace_seconds() -> int:
     return DEFAULT_CRASH_GRACE_SECONDS
 
 
+# Grace period between first observing that a worker's task has left
+# ``running`` (done / blocked / cancelled / superseded) and force-killing
+# the worker's still-alive process group. Gives a worker that just called
+# ``kanban_complete`` a window to wind down and exit on its own before the
+# orphan reaper escalates to a group SIGTERM/SIGKILL. A self-completing
+# worker normally exits in well under a second; anything still alive after
+# this window is stuck (or has spawned children that outlived it) and is
+# reaped. See :func:`reap_orphaned_workers`.
+DEFAULT_ORPHAN_REAP_GRACE_SECONDS = 30
+
+# Number of 0.5 s ticks the orphan reaper waits after SIGTERM-ing a stuck
+# worker's process group before escalating to SIGKILL. These workers have
+# already had ``DEFAULT_ORPHAN_REAP_GRACE_SECONDS`` to exit cleanly, so the
+# post-SIGTERM window is deliberately short.
+_ORPHAN_KILL_GRACE_TICKS = 6
+
+
+def _resolve_orphan_reap_grace_seconds() -> int:
+    """Return the orphan-reap grace period in seconds.
+
+    Reads ``HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS`` from the environment;
+    falls back to ``DEFAULT_ORPHAN_REAP_GRACE_SECONDS`` when absent, empty,
+    non-integer, or negative. A value of 0 reaps a lingering worker on the
+    very next tick after its task leaves ``running`` (useful for tests).
+    """
+    raw = os.environ.get("HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_ORPHAN_REAP_GRACE_SECONDS
+
+
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """Return the rate-limit requeue cooldown in seconds.
 
@@ -1263,6 +1299,27 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Live worker OS-process registry, keyed by pid. Written when the
+-- dispatcher spawns a worker and cleared when the reaper confirms the
+-- process group is gone. Deliberately decoupled from ``tasks.worker_pid``
+-- (which is NULLed the instant a task leaves ``running``): a worker that
+-- keeps running after its task is done / blocked / cancelled — or is
+-- superseded by a re-spawn — would otherwise be invisible to every reaper
+-- and keep hammering the model. ``pgid`` is the worker's process-group id
+-- (== pid at spawn, since workers start a new session), so the reaper can
+-- signal the whole tree even after the group leader itself has exited.
+-- ``orphaned_at`` is stamped the first tick the worker is seen to have
+-- outlived its task, arming the grace window before a forced group kill.
+CREATE TABLE IF NOT EXISTS worker_procs (
+    pid           INTEGER PRIMARY KEY,
+    pgid          INTEGER NOT NULL,
+    task_id       TEXT NOT NULL,
+    run_id        INTEGER,
+    claim_lock    TEXT,
+    registered_at INTEGER NOT NULL,
+    orphaned_at   INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1273,6 +1330,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_worker_procs_task      ON worker_procs(task_id);
 """
 
 
@@ -5720,6 +5778,12 @@ class DispatchResult:
     "task is genuinely stuck"."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
+    reaped_orphans: list[int] = field(default_factory=list)
+    """PIDs of worker processes force-killed because they kept running after
+    their task left ``running`` (done / blocked / superseded). Empty on a
+    healthy board; non-empty means the orphan reaper caught a worker that
+    would otherwise have kept hammering the model. See
+    :func:`reap_orphaned_workers`."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -5912,6 +5976,87 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _default_worker_signal(target: int, sig: int) -> None:
+    """Deliver ``sig`` to a dispatcher worker's whole process group.
+
+    This is the real-runtime default behind every worker-termination path
+    (``signal_fn`` stays the ``(target, sig)`` test seam). Workers are
+    spawned with ``start_new_session=True``, so each worker leads its own
+    process group whose id equals the worker pid. Signalling the *group*
+    (``os.killpg``) instead of just the leader pid is what reaches the
+    children the worker spawned — nested tool subprocesses, the process
+    actually streaming from the model — so a terminated worker cannot leave
+    orphaned descendants that get reparented to init and keep hammering the
+    provider. That orphaning is exactly why a leader-only SIGTERM appeared
+    to "not kill" a finished task before.
+
+    ``target`` may be a live leader pid or a bare pgid (the leader can be
+    gone while children live on): ``os.getpgid`` resolves the group when
+    the leader is alive, and falls back to ``target`` itself otherwise —
+    correct because a start-new-session leader's pid *is* its pgid. Degrades
+    to a plain ``os.kill`` on Windows (no process groups) or when the group
+    cannot be resolved.
+    """
+    itarget = int(target)
+    if _IS_WINDOWS or not hasattr(os, "killpg"):
+        os.kill(itarget, sig)
+        return
+    try:
+        pgid = os.getpgid(itarget)
+    except (ProcessLookupError, OSError):
+        # Leader already reaped; it led its own group, so its pid doubles
+        # as the pgid for any surviving children.
+        pgid = itarget
+    # Never signal pgid 0 ("every process in the caller's group") or the
+    # dispatcher's own group — a recycled pid must not take down the
+    # gateway/dispatcher that hosts this reaper.
+    try:
+        own_pgid = os.getpgrp()
+    except OSError:
+        own_pgid = -1
+    if pgid <= 0 or pgid == own_pgid:
+        os.kill(itarget, sig)
+        return
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        # Whole group already gone — nothing to do.
+        pass
+    except OSError:
+        # killpg refused (e.g. EPERM) — fall back to the lone leader pid.
+        try:
+            os.kill(itarget, sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _process_group_alive(pgid: Optional[int]) -> bool:
+    """Return True if any process still belongs to process group ``pgid``.
+
+    Uses ``killpg(pgid, 0)``: ``ProcessLookupError`` (ESRCH) means the group
+    is empty — every member, leader and children, has exited — so the worker
+    tree is truly gone. ``PermissionError`` (EPERM) means members exist that
+    we may not signal, which still counts as alive. This is what lets the
+    orphan reaper detect a worker whose *leader* already exited but whose
+    children are still running: the group id stays reserved by the kernel as
+    long as any member lives, so a bare leader-pid liveness check would
+    wrongly report the tree dead. Falls back to a pid check on Windows.
+    """
+    if not pgid or pgid <= 0:
+        return False
+    if _IS_WINDOWS or not hasattr(os, "killpg"):
+        return _pid_alive(pgid)
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -5936,8 +6081,12 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
+    # Default to a process-GROUP signal so the worker's children die with
+    # it — a leader-only SIGTERM leaves orphaned descendants that keep
+    # hammering the model. ``signal_fn`` stays the ``(target, sig)`` test
+    # seam. See :func:`_default_worker_signal`.
     kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
+        _default_worker_signal if hasattr(os, "kill") else None
     )
     if kill is None:
         return info
@@ -6131,8 +6280,11 @@ def enforce_max_runtime(
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
         killed = False
+        # Process-GROUP signal by default so a timed-out worker's children
+        # go down with it (see :func:`_default_worker_signal`); ``signal_fn``
+        # is the ``(target, sig)`` test seam.
         kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+            _default_worker_signal if hasattr(os, "kill") else None
         )
         if kill is not None:
             try:
@@ -6540,6 +6692,175 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _terminate_worker_group(pgid: int, *, signal_fn=None) -> bool:
+    """SIGTERM, then (after a short grace) SIGKILL, an entire worker group.
+
+    Returns True when the process group is empty afterward. ``signal_fn`` is
+    the ``(target, sig)`` test seam; the real default is
+    :func:`_default_worker_signal`, which routes to ``os.killpg`` so every
+    process in the group dies — the leader *and* the children that would
+    otherwise be orphaned and keep hammering the provider. The SIGTERM →
+    SIGKILL escalation is what guarantees death even for a worker that
+    ignores (or is too wedged to handle) SIGTERM: the exact failure the
+    operator hit when only a manual SIGKILL cleared a "finished" task.
+    """
+    import signal as _signal
+    kill = signal_fn if signal_fn is not None else (
+        _default_worker_signal if hasattr(os, "kill") else None
+    )
+    if kill is None:
+        return not _process_group_alive(pgid)
+    try:
+        kill(int(pgid), _signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return not _process_group_alive(pgid)
+    for _ in range(max(1, _ORPHAN_KILL_GRACE_TICKS)):
+        if not _process_group_alive(pgid):
+            return True
+        time.sleep(0.5)
+    if _process_group_alive(pgid):
+        try:
+            _sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+            kill(int(pgid), _sigkill)
+        except (ProcessLookupError, OSError):
+            pass
+    return not _process_group_alive(pgid)
+
+
+def reap_orphaned_workers(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> list[int]:
+    """Kill worker processes that have outlived their task.
+
+    The gap this closes: ``complete_task`` / ``block_task`` / ``_end_run``
+    NULL ``tasks.worker_pid`` the instant a task leaves ``running``, so a
+    worker that keeps running after that — because it self-completed but
+    didn't exit, was completed out from under itself by the CLI/dashboard,
+    or was superseded by a re-spawn — is invisible to every other reaper
+    (:func:`detect_crashed_workers`, :func:`enforce_max_runtime`,
+    :func:`detect_stale_running` all key off ``status='running' AND
+    worker_pid IS NOT NULL``). Such a worker keeps hammering the model
+    forever. This reaper tracks workers in the durable ``worker_procs``
+    registry instead, independently of task status.
+
+    Each tick, for every host-local registered worker:
+
+    * **Group already empty** → the worker (and its children) exited; drop
+      the registry row.
+    * **Still the live worker of a running task** → healthy; leave it (and
+      clear any stale orphan stamp).
+    * **Otherwise (orphan)** → stamp ``orphaned_at`` on first sighting to
+      arm a grace window (a just-completed worker gets a moment to exit on
+      its own), then once the window elapses force the whole process group
+      down with SIGTERM→SIGKILL and drop the row.
+
+    Whole-*group* liveness (:func:`_process_group_alive`) — not a bare
+    leader-pid check — is used throughout so a worker whose leader already
+    exited but whose children survive is still detected and reaped. Runs
+    host-local (same single-host reasoning as the other reapers): only
+    workers whose ``claim_lock`` names this host are candidates. Returns the
+    pids reaped this tick.
+    """
+    reaped: list[int] = []
+    try:
+        rows = conn.execute(
+            "SELECT pid, pgid, task_id, claim_lock, orphaned_at "
+            "FROM worker_procs"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # ``worker_procs`` absent (a pre-migration DB opened by an older
+        # process that predates this table). Nothing to reap; the table is
+        # created on the next init/restart.
+        return reaped
+    if not rows:
+        return reaped
+
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    grace = _resolve_orphan_reap_grace_seconds()
+    now = int(time.time())
+
+    for row in rows:
+        pid = int(row["pid"])
+        pgid = int(row["pgid"]) if row["pgid"] is not None else pid
+        lock = row["claim_lock"] or ""
+
+        # Only manage workers this host spawned. A foreign (or empty)
+        # claim_lock means we can't meaningfully signal the process; leave
+        # the row for the owning host's dispatcher rather than guess.
+        if not lock.startswith(host_prefix):
+            continue
+
+        # Whole-group liveness: catches the "leader exited, children still
+        # running" orphan that a leader-pid check would miss.
+        if not _process_group_alive(pgid):
+            _deregister_worker_proc(conn, pid)
+            continue
+
+        trow = conn.execute(
+            "SELECT status, worker_pid FROM tasks WHERE id = ?",
+            (row["task_id"],),
+        ).fetchone()
+        still_active = (
+            trow is not None
+            and trow["status"] == "running"
+            and trow["worker_pid"] is not None
+            and int(trow["worker_pid"]) == pid
+        )
+        if still_active:
+            # Healthy in-flight worker. Clear any stale orphan stamp left by
+            # a transient blip (e.g. a task that bounced back to running
+            # under the same pid).
+            if row["orphaned_at"] is not None:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE worker_procs SET orphaned_at = NULL "
+                        "WHERE pid = ?",
+                        (pid,),
+                    )
+            continue
+
+        # Orphan: task is done / blocked / gone, or this pid was superseded
+        # by a re-spawn. Arm the grace window on first sighting.
+        orphaned_at = row["orphaned_at"]
+        if orphaned_at is None:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE worker_procs SET orphaned_at = ? "
+                    "WHERE pid = ? AND orphaned_at IS NULL",
+                    (now, pid),
+                )
+            if grace > 0:
+                continue  # give the worker the grace window to self-exit
+            orphaned_at = now
+        if now - int(orphaned_at) < grace:
+            continue
+
+        # Grace elapsed and still alive → force the whole tree down.
+        killed = _terminate_worker_group(pgid, signal_fn=signal_fn)
+        if trow is not None:
+            # Leave an audit trail on the task so `hermes kanban tail` shows
+            # why the process was killed. Skipped when the task row is gone.
+            with write_txn(conn):
+                _append_event(
+                    conn, row["task_id"], "orphan_reaped",
+                    {
+                        "pid": pid,
+                        "pgid": pgid,
+                        "task_status": trow["status"],
+                        "orphaned_for_seconds": now - int(orphaned_at),
+                        "killed": bool(killed),
+                    },
+                )
+        _deregister_worker_proc(conn, pid)
+        reaped.append(pid)
+
+    return reaped
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6718,6 +7039,10 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
+
+    Also registers the process in ``worker_procs`` (keyed by pid) so it can
+    be reaped later even after ``tasks.worker_pid`` is NULLed by a terminal
+    transition. See :func:`reap_orphaned_workers`.
     """
     with write_txn(conn):
         conn.execute(
@@ -6731,6 +7056,46 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _register_worker_proc(conn, task_id, int(pid), run_id)
+
+
+def _register_worker_proc(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    run_id: Optional[int],
+) -> None:
+    """Record a live worker process in the ``worker_procs`` registry.
+
+    Must be called inside an open ``write_txn`` (``_set_worker_pid`` already
+    holds one). The worker is spawned with ``start_new_session=True``, so its
+    process-group id equals its pid at spawn time; we store that as ``pgid``
+    so the reaper can signal the whole tree even after the leader exits. The
+    task's current ``claim_lock`` is captured for host-local gating in the
+    reaper. Keyed by pid with ``INSERT OR REPLACE`` so a recycled pid can
+    never leave a stale row behind.
+    """
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT claim_lock FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    claim_lock = row["claim_lock"] if row is not None else None
+    conn.execute(
+        "INSERT OR REPLACE INTO worker_procs "
+        "(pid, pgid, task_id, run_id, claim_lock, registered_at, orphaned_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        (int(pid), int(pid), task_id, run_id, claim_lock, now),
+    )
+
+
+def _deregister_worker_proc(conn: sqlite3.Connection, pid: int) -> None:
+    """Drop a worker's ``worker_procs`` row (its own ``write_txn``).
+
+    Called when the reaper confirms a worker's process group is gone
+    (clean exit) or after it force-kills a stuck orphan.
+    """
+    with write_txn(conn):
+        conn.execute("DELETE FROM worker_procs WHERE pid = ?", (int(pid),))
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7082,6 +7447,12 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Reap workers that kept running after their task left ``running`` — the
+    # done/blocked/superseded orphans that NULLed ``tasks.worker_pid`` hides
+    # from every status-keyed reaper above. Kills the whole process group so
+    # orphaned children die too. See reap_orphaned_workers() for the full
+    # rationale.
+    result.reaped_orphans = reap_orphaned_workers(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather

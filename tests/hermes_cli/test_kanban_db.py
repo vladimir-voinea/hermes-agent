@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -4790,3 +4791,306 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Orphan reaper — kill workers (and their children) that outlive their task
+# ---------------------------------------------------------------------------
+
+# A worker that ignores SIGTERM and forks a child that also ignores it. This
+# reproduces the operator's report: a "finished" task whose worker survived
+# SIGTERM and only died on SIGKILL, having spawned a child that kept running.
+_LEADER_IGNORES_SIGTERM = (
+    "import sys, time, signal, subprocess\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "child = subprocess.Popen([sys.executable, '-c',\n"
+    "    'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)'])\n"
+    "with open(sys.argv[1], 'w') as f:\n"
+    "    f.write(str(child.pid)); f.flush()\n"
+    "time.sleep(300)\n"
+)
+
+# A worker (SIGTERM-responsive) that forks a SIGTERM-responsive child. Used to
+# exercise the "leader already exited, child still alive" orphan.
+_LEADER_PLAIN = (
+    "import sys, time, subprocess\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+    "with open(sys.argv[1], 'w') as f:\n"
+    "    f.write(str(child.pid)); f.flush()\n"
+    "time.sleep(300)\n"
+)
+
+
+def _wait_until(pred, timeout=5.0, interval=0.05):
+    """Poll ``pred`` until true or timeout; return its final value."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(interval)
+    return pred()
+
+
+def _spawn_worker_group(tmp_path, code):
+    """Spawn a real leader+child process group, like ``_default_spawn`` does.
+
+    Returns ``(leader_proc, child_pid)``. The leader is its own session /
+    process-group leader (``start_new_session=True``) and forks a child that
+    shares the group — standing in for the model-calling subprocess a real
+    worker spawns. Both members are confirmed live before returning.
+    """
+    pidfile = tmp_path / f"childpid-{os.getpid()}-{time.time_ns()}"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(pidfile)],
+        start_new_session=True,
+    )
+    assert _wait_until(
+        lambda: pidfile.exists() and pidfile.read_text().strip() != ""
+    ), "leader never reported its child pid"
+    child_pid = int(pidfile.read_text().strip())
+    assert kb._pid_alive(proc.pid)
+    assert _wait_until(lambda: kb._pid_alive(child_pid))
+    # Child shares the leader's group (pgid == leader pid at spawn).
+    assert os.getpgid(child_pid) == proc.pid
+    return proc, child_pid
+
+
+def _cleanup_group(proc):
+    """Best-effort: SIGKILL the whole group and reap the leader zombie."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _make_running_worker_task(conn, pid):
+    """Create a host-local, claimed+running task and register ``pid`` on it."""
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title="orphan-repro", assignee="a")
+    kb.claim_task(conn, tid, claimer=f"{host}:w")
+    assert kb.get_task(conn, tid).status == "running"
+    kb._set_worker_pid(conn, tid, pid)
+    return tid
+
+
+@pytest.mark.live_system_guard_bypass  # spawns + signals only its own procs
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+def test_reap_orphaned_workers_kills_whole_group_incl_children(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A done task whose worker (and child) keep running is force-reaped.
+
+    This is the end-to-end reproduction of the operator's bug: the task is
+    ``done`` but the worker survives SIGTERM. The reaper must escalate to
+    SIGKILL AND take down the worker's child (which a leader-only kill would
+    orphan). Uses real processes — no mocked signals.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS", "0")
+    # Keep the post-SIGTERM escalation window short so the test is quick,
+    # while still exercising the real SIGTERM→SIGKILL path.
+    monkeypatch.setattr(kb, "_ORPHAN_KILL_GRACE_TICKS", 2)
+
+    proc, child_pid = _spawn_worker_group(tmp_path, _LEADER_IGNORES_SIGTERM)
+    try:
+        with kb.connect() as conn:
+            tid = _make_running_worker_task(conn, proc.pid)
+            # Task finishes but the worker never exits — the orphan.
+            assert kb.complete_task(conn, tid)
+            assert kb.get_task(conn, tid).status == "done"
+            # tasks.worker_pid is now NULL, but the registry still tracks it.
+            assert kb.get_task(conn, tid).worker_pid is None
+            assert conn.execute(
+                "SELECT COUNT(*) FROM worker_procs WHERE pid = ?", (proc.pid,)
+            ).fetchone()[0] == 1
+
+            reaped = kb.reap_orphaned_workers(conn)
+
+        assert reaped == [proc.pid]
+        # The child (grandchild of the dispatcher) must be dead — the crux of
+        # the fix. A leader-only SIGTERM/SIGKILL would have left it hammering.
+        assert _wait_until(lambda: not kb._pid_alive(child_pid)), (
+            "orphaned child survived the group reap"
+        )
+        # Leader died by SIGKILL (it ignored SIGTERM) — proves escalation.
+        proc.wait(timeout=5)
+        assert proc.returncode == -signal.SIGKILL
+        assert _wait_until(lambda: not kb._process_group_alive(proc.pid))
+
+        with kb.connect() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM worker_procs WHERE pid = ?", (proc.pid,)
+            ).fetchone()[0] == 0
+            kinds = [
+                r["kind"] for r in conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
+                )
+            ]
+        assert "orphan_reaped" in kinds
+    finally:
+        _cleanup_group(proc)
+
+
+@pytest.mark.live_system_guard_bypass  # spawns + signals only its own procs
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+def test_reap_orphaned_workers_kills_children_when_leader_already_exited(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The purest orphan: the tracked leader PID is already gone, but a child
+    it spawned is still alive in the same process group.
+
+    A reaper that only checked the leader pid's liveness would see it dead and
+    walk away, leaving the child running. Group-based liveness + a group kill
+    must still catch and reap the child.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS", "0")
+
+    proc, child_pid = _spawn_worker_group(tmp_path, _LEADER_PLAIN)
+    try:
+        # Kill and reap ONLY the leader; the child stays alive & orphaned but
+        # keeps the group id (== the old leader pid).
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+        assert _wait_until(lambda: not kb._pid_alive(proc.pid))
+        assert kb._pid_alive(child_pid)
+        # Group is still alive because the child holds it.
+        assert kb._process_group_alive(proc.pid)
+
+        with kb.connect() as conn:
+            tid = _make_running_worker_task(conn, proc.pid)
+            assert kb.complete_task(conn, tid)
+            reaped = kb.reap_orphaned_workers(conn)
+
+        assert reaped == [proc.pid]
+        assert _wait_until(lambda: not kb._pid_alive(child_pid)), (
+            "orphaned child survived after leader had already exited"
+        )
+        assert _wait_until(lambda: not kb._process_group_alive(proc.pid))
+    finally:
+        _cleanup_group(proc)
+
+
+@pytest.mark.live_system_guard_bypass  # spawns + signals only its own procs
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+def test_reap_orphaned_workers_spares_healthy_running_worker(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A worker whose task is still ``running`` under the same pid is left
+    untouched — the reaper must not kill live, legitimate work."""
+    monkeypatch.setenv("HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS", "0")
+
+    proc, child_pid = _spawn_worker_group(tmp_path, _LEADER_PLAIN)
+    try:
+        with kb.connect() as conn:
+            tid = _make_running_worker_task(conn, proc.pid)
+            # Task stays running with worker_pid == proc.pid (do NOT complete).
+            reaped = kb.reap_orphaned_workers(conn)
+
+        assert reaped == []
+        assert kb._pid_alive(proc.pid)
+        assert kb._pid_alive(child_pid)
+        with kb.connect() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM worker_procs WHERE pid = ?", (proc.pid,)
+            ).fetchone()[0] == 1
+    finally:
+        _cleanup_group(proc)
+
+
+@pytest.mark.live_system_guard_bypass  # spawns + signals only its own procs
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+def test_reap_orphaned_workers_deregisters_already_dead_worker(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A worker that exited cleanly is dropped from the registry without any
+    kill and without an ``orphan_reaped`` event."""
+    monkeypatch.setenv("HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS", "0")
+
+    # A short-lived process; capture its pid, then let it fully exit + reap.
+    proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    dead_pid = proc.pid
+    proc.wait(timeout=5)
+    assert _wait_until(lambda: not kb._process_group_alive(dead_pid))
+
+    with kb.connect() as conn:
+        tid = _make_running_worker_task(conn, dead_pid)
+        assert kb.complete_task(conn, tid)
+        reaped = kb.reap_orphaned_workers(conn)
+
+        assert reaped == []
+        assert conn.execute(
+            "SELECT COUNT(*) FROM worker_procs WHERE pid = ?", (dead_pid,)
+        ).fetchone()[0] == 0
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
+            )
+        ]
+    assert "orphan_reaped" not in kinds
+
+
+@pytest.mark.live_system_guard_bypass  # spawns + signals only its own procs
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+def test_reap_orphaned_workers_grace_defers_then_kills(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The grace window gives a just-finished worker time to exit on its own;
+    only once it elapses does the reaper force the group down."""
+    monkeypatch.setenv("HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS", "3600")
+    monkeypatch.setattr(kb, "_ORPHAN_KILL_GRACE_TICKS", 2)
+
+    proc, child_pid = _spawn_worker_group(tmp_path, _LEADER_PLAIN)
+    try:
+        with kb.connect() as conn:
+            tid = _make_running_worker_task(conn, proc.pid)
+            assert kb.complete_task(conn, tid)
+
+            # First tick: arms the grace window, does not kill.
+            assert kb.reap_orphaned_workers(conn) == []
+            assert kb._pid_alive(proc.pid)
+            row = conn.execute(
+                "SELECT orphaned_at FROM worker_procs WHERE pid = ?", (proc.pid,)
+            ).fetchone()
+            assert row is not None and row["orphaned_at"] is not None
+
+            # Backdate the orphan stamp past the grace window and re-run.
+            conn.execute(
+                "UPDATE worker_procs SET orphaned_at = ? WHERE pid = ?",
+                (int(time.time()) - 4000, proc.pid),
+            )
+            conn.commit()
+            reaped = kb.reap_orphaned_workers(conn)
+
+        assert reaped == [proc.pid]
+        assert _wait_until(lambda: not kb._pid_alive(child_pid))
+        # Reap the leader zombie (child of this test process) so the group is
+        # truly empty before asserting on group liveness.
+        proc.wait(timeout=5)
+        assert _wait_until(lambda: not kb._process_group_alive(proc.pid))
+    finally:
+        _cleanup_group(proc)
+
+
+@pytest.mark.live_system_guard_bypass  # spawns + signals only its own procs
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+def test_dispatch_once_reaps_orphans(kanban_home, tmp_path, monkeypatch):
+    """The orphan reaper is wired into the dispatch tick and its result is
+    surfaced on ``DispatchResult.reaped_orphans``."""
+    monkeypatch.setenv("HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_ORPHAN_KILL_GRACE_TICKS", 2)
+
+    proc, child_pid = _spawn_worker_group(tmp_path, _LEADER_PLAIN)
+    try:
+        with kb.connect() as conn:
+            tid = _make_running_worker_task(conn, proc.pid)
+            assert kb.complete_task(conn, tid)
+            # No ready work → dispatch does no spawning, just maintenance.
+            result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+
+        assert proc.pid in result.reaped_orphans
+        assert _wait_until(lambda: not kb._pid_alive(child_pid))
+    finally:
+        _cleanup_group(proc)
