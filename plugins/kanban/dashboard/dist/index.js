@@ -195,6 +195,81 @@
   const API = "/api/plugins/kanban";
   const MIME_TASK = "text/x-hermes-task";
 
+  // ---- Linear redesign: density + keyboard prefs -----------------------
+  const DENSITY_KEY = "hermes.kanban.density";
+  const DRAWER_WIDTH_KEY = "hermes.kanban.drawerWidth";
+  const SHOW_DONE_KEY = "hermes.kanban.showDone";
+  const HIDE_EMPTY_KEY = "hermes.kanban.hideEmpty";
+  const DENSITY_MODES = ["comfortable", "compact", "dense"];
+  // Columns that drive work. Done/archived are history — not a fifth/sixth
+  // full-width swimlane that forces horizontal scroll forever.
+  const ACTIVE_COLUMNS = ["triage", "todo", "ready", "running", "blocked", "scheduled"];
+  const HISTORY_COLUMNS = ["done", "archived"];
+  function readDensity() {
+    try {
+      const v = localStorage.getItem(DENSITY_KEY);
+      if (DENSITY_MODES.indexOf(v) >= 0) return v;
+    } catch (e) {}
+    return "compact";
+  }
+  function writeDensity(v) {
+    try { localStorage.setItem(DENSITY_KEY, v); } catch (e) {}
+  }
+  function readDrawerWidth() {
+    try {
+      const n = Number(localStorage.getItem(DRAWER_WIDTH_KEY));
+      if (Number.isFinite(n) && n >= 420 && n <= 960) return n;
+    } catch (e) {}
+    return 680;
+  }
+  function writeDrawerWidth(n) {
+    try { localStorage.setItem(DRAWER_WIDTH_KEY, String(n)); } catch (e) {}
+  }
+  function readBool(key, fallback) {
+    try {
+      const v = localStorage.getItem(key);
+      if (v === "1" || v === "true") return true;
+      if (v === "0" || v === "false") return false;
+    } catch (e) {}
+    return fallback;
+  }
+  function writeBool(key, v) {
+    try { localStorage.setItem(key, v ? "1" : "0"); } catch (e) {}
+  }
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = (el.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return true;
+    if (el.isContentEditable) return true;
+    if (el.closest && el.closest("[contenteditable='true']")) return true;
+    // Also treat role=textbox / combobox popups as typing surfaces
+    if (el.closest && el.closest("[role='textbox'], [role='combobox'], [role='searchbox']")) return true;
+    return false;
+  }
+  function cssEscape(id) {
+    if (typeof CSS !== "undefined" && CSS.escape) return cssEscape(id);
+    return String(id).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+  }
+  const EMPTY_COLUMN = {
+    triage:   { icon: "◎", title: "No ideas yet", hint: "Drop rough thoughts here. Press C to capture." },
+    todo:     { icon: "○", title: "Nothing queued", hint: "Tasks waiting on parents or planning land here." },
+    ready:    { icon: "▷", title: "Nothing ready", hint: "Assignable work the dispatcher can claim." },
+    running:  { icon: "◉", title: "No agents running", hint: "Live worker claims show up in this column." },
+    blocked:  { icon: "⏸", title: "No blockers", hint: "Human-in-the-loop waits surface here." },
+    scheduled:{ icon: "◷", title: "Nothing scheduled", hint: "Time-gated work parks here until due." },
+    done:     { icon: "✓", title: "Nothing done yet", hint: "Completed tasks collect here." },
+    archived: { icon: "▤", title: "Archive is empty", hint: "Archived cards stay out of the main flow." },
+  };
+  function emptyCopy(status, t) {
+    const fb = EMPTY_COLUMN[status] || { icon: "·", title: tx(t, "noTasks", "No tasks"), hint: "" };
+    return {
+      icon: fb.icon,
+      title: tx(t, "empty." + status + ".title", fb.title),
+      hint: tx(t, "empty." + status + ".hint", fb.hint),
+    };
+  }
+
+
   // Docs link — surfaced as a `?` icon next to the board switcher and as
   // `title=` hints on unlabelled controls. Kept in one place so rebrands or
   // path changes are a single edit.
@@ -527,7 +602,15 @@
     const [assigneeFilter, setAssigneeFilter] = useState("");
     const [includeArchived, setIncludeArchived] = useState(false);
     const [search, setSearch] = useState("");
-    const [laneByProfile, setLaneByProfile] = useState(true);
+    const [laneByProfile, setLaneByProfile] = useState(false);
+    const [showDone, setShowDone] = useState(function () { return readBool(SHOW_DONE_KEY, false); });
+    const [hideEmpty, setHideEmpty] = useState(function () { return readBool(HIDE_EMPTY_KEY, true); });
+    const setShowDonePersist = useCallback(function (v) {
+      setShowDone(!!v); writeBool(SHOW_DONE_KEY, !!v);
+    }, []);
+    const setHideEmptyPersist = useCallback(function (v) {
+      setHideEmpty(!!v); writeBool(HIDE_EMPTY_KEY, !!v);
+    }, []);
     const [configApplied, setConfigApplied] = useState(false);
 
     const [selectedTaskId, setSelectedTaskId] = useState(null);
@@ -535,6 +618,21 @@
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
     const [draggingTaskId, setDraggingTaskId] = useState(null);
+    const [density, setDensity] = useState(readDensity);
+    const [focusedTaskId, setFocusedTaskId] = useState(null);
+    const [showHelp, setShowHelp] = useState(false);
+    const [drawerWidth, setDrawerWidth] = useState(readDrawerWidth);
+    const searchInputRef = useRef(null);
+    const setDensityPersist = useCallback(function (mode) {
+      if (DENSITY_MODES.indexOf(mode) < 0) return;
+      setDensity(mode);
+      writeDensity(mode);
+    }, []);
+    const cycleDensity = useCallback(function (dir) {
+      const i = DENSITY_MODES.indexOf(density);
+      const next = DENSITY_MODES[(i + (dir || 1) + DENSITY_MODES.length) % DENSITY_MODES.length];
+      setDensityPersist(next);
+    }, [density, setDensityPersist]);
     const handleDragStart = useCallback(function (taskId) { setDraggingTaskId(taskId); }, []);
     const handleDragEnd = useCallback(function () { setDraggingTaskId(null); }, []);
     // Per-task event counter incremented whenever the WS stream reports
@@ -556,7 +654,9 @@
           setConfig(c);
           if (!configApplied) {
             if (c.default_tenant) setTenantFilter(c.default_tenant);
-            if (typeof c.lane_by_profile === "boolean") setLaneByProfile(c.lane_by_profile);
+            // Intentionally ignore config.lane_by_profile=true — profile lanes
+            // turn Running into a tall stack of micro-columns. Default off;
+            // user can toggle in the toolbar.
             if (typeof c.include_archived_by_default === "boolean") setIncludeArchived(c.include_archived_by_default);
             setConfigApplied(true);
           }
@@ -1020,6 +1120,46 @@
 
     const totalVisible = flatTasks.length;
 
+    // Split active work columns from history (done/archived). History is
+    // collapsed by default so a fat Done pile can't dominate the board.
+    const viewBoard = useMemo(function () {
+      if (!filteredBoard) return null;
+      let cols = (filteredBoard.columns || []).slice();
+      if (!showDone) {
+        cols = cols.filter(function (c) { return HISTORY_COLUMNS.indexOf(c.name) < 0; });
+      }
+      if (hideEmpty) {
+        // Keep the four work columns even when empty (drop targets).
+        // Everything else empty (triage/scheduled/review/custom/history) hides.
+        const always = { todo: 1, ready: 1, running: 1, blocked: 1 };
+        cols = cols.filter(function (c) {
+          const n = (c.tasks || []).length;
+          if (n > 0) return true;
+          return !!always[c.name];
+        });
+      }
+      // Prefer stable active order, then history at the end if shown.
+      const rank = function (name) {
+        const a = ACTIVE_COLUMNS.indexOf(name);
+        if (a >= 0) return a;
+        const h = HISTORY_COLUMNS.indexOf(name);
+        if (h >= 0) return 100 + h;
+        return 50;
+      };
+      cols = cols.slice().sort(function (a, b) { return rank(a.name) - rank(b.name); });
+      return Object.assign({}, filteredBoard, { columns: cols });
+    }, [filteredBoard, showDone, hideEmpty]);
+
+    const historyCounts = useMemo(function () {
+      const out = { done: 0, archived: 0 };
+      if (!filteredBoard) return out;
+      for (const col of filteredBoard.columns || []) {
+        if (col.name === "done") out.done = (col.tasks || []).length;
+        if (col.name === "archived") out.archived = (col.tasks || []).length;
+      }
+      return out;
+    }, [filteredBoard]);
+
     const focusTaskByOffset = useCallback(function (delta) {
       if (!flatTasks.length) return;
       let idx = flatTasks.findIndex(function (tk) { return tk.id === focusedTaskId; });
@@ -1031,15 +1171,16 @@
       setFocusedTaskId(id);
       // Ensure DOM focus for a11y + Enter handling on the card itself
       requestAnimationFrame(function () {
-        const el = document.querySelector('.hermes-kanban-card[data-task-id="' + CSS.escape(id) + '"]');
+        const el = document.querySelector('.hermes-kanban-card[data-task-id="' + cssEscape(id) + '"]');
         if (el && el.focus) el.focus({ preventScroll: false });
         if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest", inline: "nearest" });
       });
     }, [flatTasks, focusedTaskId]);
 
     const focusInColumn = useCallback(function (colDelta) {
-      if (!filteredBoard || !flatTasks.length) return;
-      const cols = filteredBoard.columns;
+      const boardForNav = viewBoard || filteredBoard;
+      if (!boardForNav || !flatTasks.length) return;
+      const cols = boardForNav.columns;
       let curCol = 0;
       let curRow = 0;
       if (focusedTaskId) {
@@ -1063,11 +1204,11 @@
       const id = tasks[row].id;
       setFocusedTaskId(id);
       requestAnimationFrame(function () {
-        const el = document.querySelector('.hermes-kanban-card[data-task-id="' + CSS.escape(id) + '"]');
+        const el = document.querySelector('.hermes-kanban-card[data-task-id="' + cssEscape(id) + '"]');
         if (el && el.focus) el.focus({ preventScroll: false });
         if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest", inline: "nearest" });
       });
-    }, [filteredBoard, flatTasks, focusedTaskId]);
+    }, [viewBoard, filteredBoard, flatTasks, focusedTaskId]);
 
     useEffect(function () {
       function onKey(e) {
@@ -1237,6 +1378,11 @@
           assigneeFilter, setAssigneeFilter,
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
+          showDone: showDone,
+          setShowDone: setShowDonePersist,
+          hideEmpty: hideEmpty,
+          setHideEmpty: setHideEmptyPersist,
+          historyCounts: historyCounts,
           search, setSearch,
           density, setDensity: setDensityPersist,
           searchInputRef: searchInputRef,
@@ -1273,8 +1419,14 @@
                 h(Button, { size: "sm", onClick: function () { setShowHelp(true); } }, "Keyboard shortcuts"),
               ),
             ) : null,
+        (!showDone && (historyCounts.done + historyCounts.archived) > 0)
+          ? h(HistoryRail, {
+              counts: historyCounts,
+              onShow: function () { setShowDonePersist(true); },
+            })
+          : null,
         h(BoardColumns, {
-          board: filteredBoard,
+          board: viewBoard || filteredBoard,
           laneByProfile,
           selectedIds,
           failedIds,
@@ -2264,6 +2416,25 @@
   // Toolbar
   // -------------------------------------------------------------------------
 
+  function HistoryRail(props) {
+    const c = props.counts || { done: 0, archived: 0 };
+    const total = (c.done || 0) + (c.archived || 0);
+    if (!total) return null;
+    return h("div", { className: "hermes-kanban-history-rail" },
+      h("div", { className: "hermes-kanban-history-rail-text" },
+        h("span", { className: "hermes-kanban-history-rail-label" }, "Completed"),
+        h("span", { className: "hermes-kanban-history-rail-meta" },
+          (c.done || 0) + " done" + ((c.archived || 0) ? (" · " + c.archived + " archived") : "")),
+      ),
+      h("button", {
+        type: "button",
+        className: "hermes-kanban-history-rail-btn",
+        onClick: props.onShow,
+        title: "Show Done and Archived as columns",
+      }, "Show history"),
+    );
+  }
+
   function BoardToolbar(props) {
     const { t } = useI18n();
     const tenants = (props.board && props.board.tenants) || [];
@@ -2313,21 +2484,45 @@
           }),
         ),
       ),
-      h("label", { className: "flex items-center gap-2 text-xs",
-                   title: "Include archived tasks in the board view." },
+      h("label", { className: "flex items-center gap-2 text-xs hermes-kanban-toolbar-check",
+                   title: "Show Done + Archived as full columns. Hidden by default — completed work is a history rail, not a swimlane." },
+        h(Checkbox, {
+          checked: !!props.showDone,
+          onCheckedChange: function (checked) {
+            if (props.setShowDone) props.setShowDone(checked === true);
+          },
+        }),
+        "Done/Archived",
+        (props.historyCounts && (props.historyCounts.done + props.historyCounts.archived) > 0)
+          ? h("span", { className: "hermes-kanban-toolbar-count" },
+              String(props.historyCounts.done + props.historyCounts.archived))
+          : null,
+      ),
+      h("label", { className: "flex items-center gap-2 text-xs hermes-kanban-toolbar-check",
+                   title: "Also load archived tasks from the database into Done/Archived." },
         h(Checkbox, {
           checked: props.includeArchived,
           onCheckedChange: function (checked) { props.setIncludeArchived(checked === true); },
         }),
-        tx(t, "showArchived", "Show archived"),
+        tx(t, "showArchived", "Load archived"),
       ),
-      h("label", { className: "flex items-center gap-2 text-xs",
-                   title: "Group the Running column by assigned profile" },
+      h("label", { className: "flex items-center gap-2 text-xs hermes-kanban-toolbar-check",
+                   title: "Hide empty optional columns (triage/scheduled when empty)." },
+        h(Checkbox, {
+          checked: !!props.hideEmpty,
+          onCheckedChange: function (checked) {
+            if (props.setHideEmpty) props.setHideEmpty(checked === true);
+          },
+        }),
+        "Hide empty",
+      ),
+      h("label", { className: "flex items-center gap-2 text-xs hermes-kanban-toolbar-check",
+                   title: "Split Running into per-profile lanes. Off by default — lanes waste vertical space." },
         h(Checkbox, {
           checked: props.laneByProfile,
           onCheckedChange: function (checked) { props.setLaneByProfile(checked === true); },
         }),
-        tx(t, "lanesByProfile", "Lanes by profile"),
+        tx(t, "lanesByProfile", "Lanes"),
       ),
       h("div", { className: "hermes-kanban-toolbar-actions" },
         h("div", {
@@ -2699,6 +2894,7 @@
     const { t } = useI18n();
     const [dragOver, setDragOver] = useState(false);
     const [showCreate, setShowCreate] = useState(false);
+    const [showAllHistory, setShowAllHistory] = useState(false);
     const colRef = useRef(null);
 
     // Listen for our synthetic touch-drop events from attachTouchDrag().
@@ -2751,10 +2947,30 @@
 
     const colHelp = getColumnHelp(t, props.column.name);
     const colLabel = getColumnLabel(t, props.column.name);
+    const isHistory = HISTORY_COLUMNS.indexOf(props.column.name) >= 0;
+    const HISTORY_CAP = 12;
+    const rawTasks = props.column.tasks || [];
+    const capped = isHistory && !showAllHistory && rawTasks.length > HISTORY_CAP;
+    const visibleTasks = capped ? rawTasks.slice(0, HISTORY_CAP) : rawTasks;
+    // When capping, also rebuild lanes from visible only
+    const displayLanes = useMemo(function () {
+      if (!lanes) return null;
+      if (!capped) return lanes;
+      // re-lane from visibleTasks only
+      const byProfile = {};
+      for (const tk of visibleTasks) {
+        const key = tk.assignee || "(unassigned)";
+        (byProfile[key] = byProfile[key] || []).push(tk);
+      }
+      return Object.keys(byProfile).sort().map(function (k) {
+        return { assignee: k, tasks: byProfile[k] };
+      });
+    }, [lanes, capped, visibleTasks]);
 
     return h("div", {
       ref: colRef,
       "data-kanban-column": props.column.name,
+      "data-history": isHistory ? "1" : "0",
       className: cn(
         "hermes-kanban-column",
         dragOver ? "hermes-kanban-column--drop" : "",
@@ -2799,7 +3015,7 @@
         onCancel: function () { setShowCreate(false); },
       }) : null,
       h("div", { className: "hermes-kanban-column-body" },
-        props.column.tasks.length === 0
+        rawTasks.length === 0
           ? (function () {
               const copy = emptyCopy(props.column.name, t);
               return h("div", { className: "hermes-kanban-empty" },
@@ -2808,8 +3024,8 @@
                 copy.hint ? h("div", { className: "hermes-kanban-empty-hint" }, copy.hint) : null,
               );
             })()
-          : lanes
-            ? lanes.map(function (lane) {
+          : (displayLanes || lanes)
+            ? (displayLanes || lanes).map(function (lane) {
                 return h("div", { key: lane.assignee, className: "hermes-kanban-lane" },
                   h("div", { className: "hermes-kanban-lane-head" },
                     h("span", { className: "hermes-kanban-lane-name" }, lane.assignee),
@@ -2831,7 +3047,7 @@
                   }),
                 );
               })
-            : props.column.tasks.map(function (tk) {
+            : visibleTasks.map(function (tk) {
                 return h(TaskCard, {
                   key: tk.id, task: tk,
                   selected: props.selectedIds.has(tk.id),
@@ -2845,6 +3061,19 @@
                   onFocus: props.onFocus,
                 });
               }),
+        capped
+          ? h("button", {
+              type: "button",
+              className: "hermes-kanban-show-more",
+              onClick: function () { setShowAllHistory(true); },
+            }, "Show all " + rawTasks.length)
+          : (isHistory && showAllHistory && rawTasks.length > HISTORY_CAP
+              ? h("button", {
+                  type: "button",
+                  className: "hermes-kanban-show-more",
+                  onClick: function () { setShowAllHistory(false); },
+                }, "Show less")
+              : null),
       ),
     );
   }

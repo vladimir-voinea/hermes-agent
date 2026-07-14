@@ -2231,3 +2231,156 @@
 .hermes-kanban-trash--active {
   opacity: 1 !important;
 }
+
+/* ===== HERMES KANBAN — LAYOUT FIX v2 (no more soviet swimlanes) =========
+ * Active columns share the viewport. Done/Archived are not full lanes by
+ * default (HistoryRail). No forced horizontal scroll for normal boards.
+ * ====================================================================== */
+
+.hermes-kanban {
+  /* Prefer filling the available width over fixed 280px tiles */
+  --hk-col-min: 200px;
+}
+
+.hermes-kanban[data-density="comfortable"] { --hk-col-min: 220px; }
+.hermes-kanban[data-density="compact"] { --hk-col-min: 200px; }
+.hermes-kanban[data-density="dense"] { --hk-col-min: 170px; }
+
+/* Columns: fluid grid that fits the screen instead of a horizontal parade */
+.hermes-kanban-columns {
+  display: grid !important;
+  grid-template-columns: repeat(auto-fit, minmax(var(--hk-col-min), 1fr)) !important;
+  gap: 0.55rem !important;
+  align-items: stretch !important;
+  overflow-x: visible !important;
+  width: 100%;
+  cursor: default !important;
+}
+/* Kill grab-pan chrome when we're not a sideways strip */
+.hermes-kanban-columns--scrollable {
+  cursor: default !important;
+}
+
+.hermes-kanban-column {
+  flex: unset !important;
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  max-height: calc(100vh - 210px) !important;
+  min-height: 12rem !important;
+}
+/* History columns (when explicitly shown) are de-emphasized */
+.hermes-kanban-column[data-history="1"] {
+  opacity: 0.92;
+  background: color-mix(in srgb, var(--color-muted, #191a1b) 35%, var(--hk-surface-1)) !important;
+}
+.hermes-kanban-column[data-history="1"] .hermes-kanban-column-label {
+  color: var(--hk-text-2) !important;
+  font-weight: 510 !important;
+}
+
+/* History rail — compact strip instead of a Done megacolumn */
+.hermes-kanban-history-rail {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.45rem 0.75rem;
+  border: 1px solid var(--hk-border-subtle);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-muted, #191a1b) 30%, transparent);
+}
+.hermes-kanban-history-rail-text {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  min-width: 0;
+}
+.hermes-kanban-history-rail-label {
+  font-size: 0.78rem;
+  font-weight: 590;
+  letter-spacing: -0.01em;
+  color: var(--hk-text);
+}
+.hermes-kanban-history-rail-meta {
+  font-size: 0.72rem;
+  color: var(--hk-text-3);
+  font-variant-numeric: tabular-nums;
+}
+.hermes-kanban-history-rail-btn {
+  appearance: none;
+  border: 1px solid var(--hk-border);
+  background: transparent;
+  color: var(--hk-text-2);
+  border-radius: 6px;
+  font-size: 0.72rem;
+  font-weight: 510;
+  padding: 0.28rem 0.55rem;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.hermes-kanban-history-rail-btn:hover {
+  color: var(--hk-text);
+  border-color: var(--hk-accent-border);
+  background: var(--hk-accent-soft);
+}
+
+.hermes-kanban-toolbar-count {
+  font-size: 0.65rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--hk-text-3);
+  background: color-mix(in srgb, var(--hk-text) 6%, transparent);
+  border: 1px solid var(--hk-border-subtle);
+  border-radius: 999px;
+  padding: 0 0.35rem;
+  line-height: 1.4;
+}
+.hermes-kanban-toolbar-check {
+  white-space: nowrap;
+}
+
+.hermes-kanban-show-more {
+  appearance: none;
+  width: 100%;
+  margin-top: 0.25rem;
+  border: 1px dashed var(--hk-border);
+  background: transparent;
+  color: var(--hk-text-2);
+  border-radius: 6px;
+  font-size: 0.72rem;
+  font-weight: 510;
+  padding: 0.4rem 0.5rem;
+  cursor: pointer;
+  font-family: inherit;
+}
+.hermes-kanban-show-more:hover {
+  color: var(--hk-text);
+  border-color: var(--hk-accent-border);
+  background: var(--hk-accent-soft);
+}
+
+/* Cards: slightly tighter meta so columns fit more content */
+.hermes-kanban-card-id {
+  max-width: 7.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Trash sits as a grid cell when visible; keep it compact */
+.hermes-kanban-trash {
+  min-height: 4.5rem !important;
+  max-height: 6rem !important;
+  align-self: end;
+}
+
+/* Narrow viewports: stack, don't invent a horizontal museum */
+@media (max-width: 720px) {
+  .hermes-kanban-columns {
+    grid-template-columns: 1fr !important;
+  }
+  .hermes-kanban-column {
+    max-height: 22rem !important;
+  }
+}
