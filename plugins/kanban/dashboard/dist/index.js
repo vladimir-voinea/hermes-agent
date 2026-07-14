@@ -1007,9 +1007,187 @@
       }).catch(function (e) { setError(String(e.message || e)); });
     }, [selectedIds, board, loadBoard, t]);
 
+
+    // --- Linear redesign: flat task order + keyboard -----------------------
+    const flatTasks = useMemo(function () {
+      if (!filteredBoard) return [];
+      const out = [];
+      for (const col of filteredBoard.columns) {
+        for (const tk of col.tasks || []) out.push(tk);
+      }
+      return out;
+    }, [filteredBoard]);
+
+    const totalVisible = flatTasks.length;
+
+    const focusTaskByOffset = useCallback(function (delta) {
+      if (!flatTasks.length) return;
+      let idx = flatTasks.findIndex(function (tk) { return tk.id === focusedTaskId; });
+      if (idx < 0) idx = delta > 0 ? -1 : 0;
+      let next = idx + delta;
+      if (next < 0) next = flatTasks.length - 1;
+      if (next >= flatTasks.length) next = 0;
+      const id = flatTasks[next].id;
+      setFocusedTaskId(id);
+      // Ensure DOM focus for a11y + Enter handling on the card itself
+      requestAnimationFrame(function () {
+        const el = document.querySelector('.hermes-kanban-card[data-task-id="' + CSS.escape(id) + '"]');
+        if (el && el.focus) el.focus({ preventScroll: false });
+        if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+    }, [flatTasks, focusedTaskId]);
+
+    const focusInColumn = useCallback(function (colDelta) {
+      if (!filteredBoard || !flatTasks.length) return;
+      const cols = filteredBoard.columns;
+      let curCol = 0;
+      let curRow = 0;
+      if (focusedTaskId) {
+        for (let ci = 0; ci < cols.length; ci++) {
+          const ri = (cols[ci].tasks || []).findIndex(function (tk) { return tk.id === focusedTaskId; });
+          if (ri >= 0) { curCol = ci; curRow = ri; break; }
+        }
+      }
+      let nextCol = curCol + colDelta;
+      if (nextCol < 0) nextCol = cols.length - 1;
+      if (nextCol >= cols.length) nextCol = 0;
+      // skip empty columns
+      let guard = 0;
+      while ((!(cols[nextCol].tasks || []).length) && guard < cols.length) {
+        nextCol = (nextCol + (colDelta >= 0 ? 1 : -1) + cols.length) % cols.length;
+        guard++;
+      }
+      const tasks = cols[nextCol].tasks || [];
+      if (!tasks.length) return;
+      const row = Math.min(curRow, tasks.length - 1);
+      const id = tasks[row].id;
+      setFocusedTaskId(id);
+      requestAnimationFrame(function () {
+        const el = document.querySelector('.hermes-kanban-card[data-task-id="' + CSS.escape(id) + '"]');
+        if (el && el.focus) el.focus({ preventScroll: false });
+        if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+    }, [filteredBoard, flatTasks, focusedTaskId]);
+
+    useEffect(function () {
+      function onKey(e) {
+        if (e.defaultPrevented) return;
+        if (isTypingTarget(e.target)) {
+          // Still allow Escape to blur / close drawer from inputs
+          if (e.key === "Escape") {
+            if (selectedTaskId) { setSelectedTaskId(null); e.preventDefault(); return; }
+            if (showHelp) { setShowHelp(false); e.preventDefault(); return; }
+            e.target.blur && e.target.blur();
+          }
+          return;
+        }
+        // Don't steal keys when a native dialog is open
+        if (document.querySelector(".hermes-kanban-dialog-backdrop")) return;
+
+        const key = e.key;
+        const meta = e.metaKey || e.ctrlKey;
+
+        if (key === "?" || (key === "/" && e.shiftKey)) {
+          e.preventDefault();
+          setShowHelp(function (v) { return !v; });
+          return;
+        }
+        if (showHelp) {
+          if (key === "Escape") { e.preventDefault(); setShowHelp(false); }
+          return;
+        }
+        if (key === "/" && !meta && !e.altKey) {
+          e.preventDefault();
+          const input = document.getElementById("hermes-kanban-search")
+            || (searchInputRef.current);
+          if (input) {
+            input.focus();
+            input.select && input.select();
+          }
+          return;
+        }
+        if (key === "Escape") {
+          if (selectedTaskId) { setSelectedTaskId(null); e.preventDefault(); return; }
+          if (selectedIds.size) { setSelectedIds(new Set()); e.preventDefault(); return; }
+          setFocusedTaskId(null);
+          return;
+        }
+        if (key === "j" || key === "ArrowDown") {
+          e.preventDefault();
+          focusTaskByOffset(1);
+          return;
+        }
+        if (key === "k" || key === "ArrowUp") {
+          e.preventDefault();
+          focusTaskByOffset(-1);
+          return;
+        }
+        if (key === "h" || key === "ArrowLeft") {
+          e.preventDefault();
+          focusInColumn(-1);
+          return;
+        }
+        if (key === "l" || key === "ArrowRight") {
+          e.preventDefault();
+          focusInColumn(1);
+          return;
+        }
+        if (key === "Enter" && focusedTaskId) {
+          e.preventDefault();
+          setSelectedTaskId(focusedTaskId);
+          return;
+        }
+        if ((key === "x" || key === " ") && focusedTaskId) {
+          // Space already opens via card handler; use x for select
+          if (key === "x") {
+            e.preventDefault();
+            setSelectedIds(function (prev) {
+              const next = new Set(prev);
+              if (next.has(focusedTaskId)) next.delete(focusedTaskId);
+              else next.add(focusedTaskId);
+              return next;
+            });
+            setLastSelectedId(focusedTaskId);
+          }
+          return;
+        }
+        if (key === "c" && !meta && !e.altKey) {
+          e.preventDefault();
+          // Prefer focused card's column, else first column
+          let colName = null;
+          if (focusedTaskId && filteredBoard) {
+            for (const col of filteredBoard.columns) {
+              if ((col.tasks || []).some(function (tk) { return tk.id === focusedTaskId; })) {
+                colName = col.name; break;
+              }
+            }
+          }
+          if (!colName && filteredBoard && filteredBoard.columns[0]) colName = filteredBoard.columns[0].name;
+          if (colName) {
+            const btn = document.querySelector('.hermes-kanban-column[data-kanban-column="' + colName + '"] .hermes-kanban-column-add');
+            if (btn) btn.click();
+          }
+          return;
+        }
+        if (key === "[" && !meta) { e.preventDefault(); cycleDensity(-1); return; }
+        if (key === "]" && !meta) { e.preventDefault(); cycleDensity(1); return; }
+        if (key === "r" && !meta && !e.altKey) {
+          e.preventDefault();
+          loadBoard();
+          return;
+        }
+      }
+      window.addEventListener("keydown", onKey);
+      return function () { window.removeEventListener("keydown", onKey); };
+    }, [
+      selectedTaskId, selectedIds, showHelp, focusedTaskId, filteredBoard,
+      focusTaskByOffset, focusInColumn, cycleDensity, loadBoard,
+    ]);
+
     // --- render -------------------------------------------------------------
     if (loading && !boardData) {
-      return h("div", { className: "p-8 text-sm text-muted-foreground" },
+      return h("div", { className: "hermes-kanban hermes-kanban-loading" },
+        h("span", { className: "hermes-kanban-loading-dot", "aria-hidden": true }),
         tx(t, "loading", "Loading Kanban board…"));
     }
     if (error && !boardData) {
@@ -1027,8 +1205,14 @@
 
     const renderMd = !config || config.render_markdown !== false;
 
+    const boardIsEmpty = totalVisible === 0;
+    const hasActiveFilters = !!(search || tenantFilter || assigneeFilter);
+
     return h(ErrorBoundary, null,
-      h("div", { className: "hermes-kanban flex flex-col gap-4" },
+      h("div", {
+        className: "hermes-kanban flex flex-col gap-4",
+        "data-density": density,
+      },
         h(BoardSwitcher, {
           board: board,
           boardList: boardList,
@@ -1054,6 +1238,9 @@
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
           search, setSearch,
+          density, setDensity: setDensityPersist,
+          searchInputRef: searchInputRef,
+          onShowHelp: function () { setShowHelp(true); },
           onNudgeDispatch: function () {
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
               .then(loadBoard)
@@ -1070,11 +1257,28 @@
          onDelete: deleteSelected,
        }) : null,
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
+        (boardIsEmpty && hasActiveFilters) ? h("div", { className: "hermes-kanban-board-empty" },
+              h("div", { className: "hermes-kanban-empty-icon", "aria-hidden": true }, "⌕"),
+              h("div", { className: "hermes-kanban-board-empty-title" },
+                tx(t, "empty.filtered.title", "No matching tasks")),
+              h("div", { className: "hermes-kanban-board-empty-hint" },
+                tx(t, "empty.filtered.hint", "Try clearing filters or searching a different id / title.")),
+              h("div", { className: "hermes-kanban-board-empty-actions" },
+                h(Button, {
+                  size: "sm",
+                  onClick: function () {
+                    setSearch(""); setTenantFilter(""); setAssigneeFilter(""); setIncludeArchived(false);
+                  },
+                }, tx(t, "clearFilters", "Clear filters")),
+                h(Button, { size: "sm", onClick: function () { setShowHelp(true); } }, "Keyboard shortcuts"),
+              ),
+            ) : null,
         h(BoardColumns, {
           board: filteredBoard,
           laneByProfile,
           selectedIds,
           failedIds,
+          focusedTaskId,
           draggingTaskId,
           onDragStart: handleDragStart,
           onDragEnd: handleDragEnd,
@@ -1085,12 +1289,15 @@
           onMoveSelected: moveSelected,
           onDelete: deleteTask,
           onOpen: setSelectedTaskId,
+          onFocus: setFocusedTaskId,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
           boardSlug: board,
+          drawerWidth: drawerWidth,
+          onDrawerWidth: function (w) { setDrawerWidth(w); writeDrawerWidth(w); },
           onClose: function () { setSelectedTaskId(null); },
           onRefresh: loadBoard,
           renderMarkdown: renderMd,
@@ -1098,6 +1305,56 @@
           assignees: (boardData && boardData.assignees) || [],
           eventTick: taskEventTick[selectedTaskId] || 0,
         }) : null,
+        showHelp ? h(KeyboardHelp, {
+          onClose: function () { setShowHelp(false); },
+        }) : null,
+      ),
+    );
+  }
+
+  function KeyboardHelp(props) {
+    const rows = [
+      ["j / ↓", "Focus next card"],
+      ["k / ↑", "Focus previous card"],
+      ["h / ←", "Jump to previous column"],
+      ["l / →", "Jump to next column"],
+      ["Enter", "Open focused card"],
+      ["x", "Toggle select focused card"],
+      ["c", "Create task in focused column"],
+      ["/", "Focus search"],
+      ["r", "Refresh board"],
+      ["[ / ]", "Cycle density"],
+      ["Esc", "Close drawer / clear selection"],
+      ["?", "Toggle this help"],
+    ];
+    return h("div", {
+      className: "hermes-kanban-help-shade",
+      onClick: props.onClose,
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": "Keyboard shortcuts",
+    },
+      h("div", {
+        className: "hermes-kanban-help",
+        onClick: function (e) { e.stopPropagation(); },
+      },
+        h("div", { className: "hermes-kanban-help-head" },
+          h("div", { className: "hermes-kanban-help-title" }, "Keyboard shortcuts"),
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-drawer-close",
+            onClick: props.onClose,
+            "aria-label": "Close",
+          }, "×"),
+        ),
+        h("div", { className: "hermes-kanban-help-grid" },
+          rows.map(function (row) {
+            return h("div", { key: row[0], className: "hermes-kanban-help-row" },
+              h("span", null, row[1]),
+              h("kbd", null, row[0]),
+            );
+          }),
+        ),
       ),
     );
   }
@@ -2011,19 +2268,27 @@
     const { t } = useI18n();
     const tenants = (props.board && props.board.tenants) || [];
     const assignees = (props.board && props.board.assignees) || [];
-    return h("div", { className: "flex flex-wrap items-end gap-3" },
-      h("div", { className: "flex flex-col gap-1",
-                 title: "Fuzzy-match tasks by id, title, or description. Matches across all columns." },
-        h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "search", "Search")),
+    const density = props.density || "compact";
+    return h("div", { className: "hermes-kanban-toolbar" },
+      h("div", {
+        className: "hermes-kanban-toolbar-search hermes-kanban-toolbar-field",
+        title: "Fuzzy-match tasks by id, title, or description. Press / to focus.",
+      },
+        h("span", { className: "hermes-kanban-toolbar-search-icon", "aria-hidden": true }, "⌕"),
         h(Input, {
+          ref: props.searchInputRef || undefined,
+          // SDK Input may not forward ref; also set via callback ref on wrapper
           placeholder: tx(t, "filterCards", "Filter cards…"),
           value: props.search,
           onChange: function (e) { props.setSearch(e.target.value); },
           className: "w-56 h-8",
+          "aria-label": tx(t, "search", "Search"),
+          id: "hermes-kanban-search",
         }),
+        h("span", { className: "hermes-kanban-toolbar-search-kbd" }, "/"),
       ),
-      h("div", { className: "flex flex-col gap-1",
-                 title: "Tenants are free-form tags on a task (e.g. customer, project, team). Set them via the task drawer or kanban_create." },
+      h("div", { className: "hermes-kanban-toolbar-field",
+                 title: "Tenants are free-form tags on a task (e.g. customer, project, team)." },
         h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "tenant", "Tenant")),
         h(Select, Object.assign({
           value: props.tenantFilter,
@@ -2035,8 +2300,8 @@
           }),
         ),
       ),
-      h("div", { className: "flex flex-col gap-1",
-                 title: "Filter by assigned Hermes profile. Profiles are the named agent identities that claim and work on tasks." },
+      h("div", { className: "hermes-kanban-toolbar-field",
+                 title: "Filter by assigned Hermes profile." },
         h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "assignee", "Assignee")),
         h(Select, Object.assign({
           value: props.assigneeFilter,
@@ -2049,7 +2314,7 @@
         ),
       ),
       h("label", { className: "flex items-center gap-2 text-xs",
-                   title: "Include archived tasks in the board view. Archived tasks are hidden by default." },
+                   title: "Include archived tasks in the board view." },
         h(Checkbox, {
           checked: props.includeArchived,
           onCheckedChange: function (checked) { props.setIncludeArchived(checked === true); },
@@ -2064,27 +2329,49 @@
         }),
         tx(t, "lanesByProfile", "Lanes by profile"),
       ),
-      h("div", { className: "flex-1" }),
-      h(Button, {
-        onClick: props.onNudgeDispatch,
-        size: "sm",
-        title: "Wake the dispatcher to claim ready tasks now instead of waiting for the next tick. Use this after adding tasks if you want them picked up immediately.",
-      }, tx(t, "nudgeDispatcher", "Nudge dispatcher")),
-      h(Button, {
-        onClick: props.onRefresh,
-        size: "sm",
-        title: "Reload the board from the database. The board auto-refreshes on task events; this is for forcing a re-read.",
-      }, tx(t, "refresh", "Refresh")),
-      h(Button, {
-        onClick: function () {
-          props.setSearch("");
-          props.setTenantFilter("");
-          props.setAssigneeFilter("");
-          props.setIncludeArchived(false);
+      h("div", { className: "hermes-kanban-toolbar-actions" },
+        h("div", {
+          className: "hermes-kanban-density",
+          role: "group",
+          "aria-label": "Board density",
+          title: "Density ([ / ] to cycle)",
         },
-        size: "sm",
-        title: "Clear all active filters (search, tenant, assignee, archived).",
-      }, tx(t, "clearFilters", "Clear filters")),
+          DENSITY_MODES.map(function (mode) {
+            return h("button", {
+              key: mode,
+              type: "button",
+              className: density === mode ? "is-active" : "",
+              onClick: function () { if (props.setDensity) props.setDensity(mode); },
+            }, mode === "comfortable" ? "Comfy" : mode === "compact" ? "Compact" : "Dense");
+          }),
+        ),
+        h("button", {
+          type: "button",
+          className: "hermes-kanban-kbd-btn",
+          title: "Keyboard shortcuts (?)",
+          onClick: props.onShowHelp,
+        }, "?"),
+        h(Button, {
+          onClick: props.onNudgeDispatch,
+          size: "sm",
+          title: "Wake the dispatcher to claim ready tasks now.",
+        }, tx(t, "nudgeDispatcher", "Nudge dispatcher")),
+        h(Button, {
+          onClick: props.onRefresh,
+          size: "sm",
+          title: "Reload the board from the database.",
+        }, tx(t, "refresh", "Refresh")),
+        h(Button, {
+          onClick: function () {
+            props.setSearch("");
+            props.setTenantFilter("");
+            props.setAssigneeFilter("");
+            props.setIncludeArchived(false);
+          },
+          size: "sm",
+          title: "Clear all active filters.",
+        }, tx(t, "clearFilters", "Clear filters")),
+      ),
     );
   }
 
@@ -2387,6 +2674,7 @@
           laneByProfile: props.laneByProfile,
           selectedIds: props.selectedIds,
           failedIds: props.failedIds,
+          focusedTaskId: props.focusedTaskId,
           draggingTaskId: props.draggingTaskId,
           toggleSelected: props.toggleSelected,
           toggleRange: props.toggleRange,
@@ -2394,6 +2682,7 @@
           onMove: props.onMove,
           onMoveSelected: props.onMoveSelected,
           onOpen: props.onOpen,
+          onFocus: props.onFocus,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
         });
@@ -2511,7 +2800,14 @@
       }) : null,
       h("div", { className: "hermes-kanban-column-body" },
         props.column.tasks.length === 0
-          ? h("div", { className: "hermes-kanban-empty" }, tx(t, "noTasks", "— no tasks —"))
+          ? (function () {
+              const copy = emptyCopy(props.column.name, t);
+              return h("div", { className: "hermes-kanban-empty" },
+                h("div", { className: "hermes-kanban-empty-icon", "aria-hidden": true }, copy.icon),
+                h("div", { className: "hermes-kanban-empty-title" }, copy.title),
+                copy.hint ? h("div", { className: "hermes-kanban-empty-hint" }, copy.hint) : null,
+              );
+            })()
           : lanes
             ? lanes.map(function (lane) {
                 return h("div", { key: lane.assignee, className: "hermes-kanban-lane" },
@@ -2523,12 +2819,14 @@
                     return h(TaskCard, {
                       key: tk.id, task: tk,
                       selected: props.selectedIds.has(tk.id),
+                      focused: props.focusedTaskId === tk.id,
                       failed: props.failedIds && props.failedIds.has(tk.id),
                       draggingTaskId: props.draggingTaskId,
                       draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
                       toggleSelected: props.toggleSelected,
                       toggleRange: props.toggleRange,
                       onOpen: props.onOpen,
+                      onFocus: props.onFocus,
                     });
                   }),
                 );
@@ -2537,12 +2835,14 @@
                 return h(TaskCard, {
                   key: tk.id, task: tk,
                   selected: props.selectedIds.has(tk.id),
+                  focused: props.focusedTaskId === tk.id,
                   failed: props.failedIds && props.failedIds.has(tk.id),
                   draggingTaskId: props.draggingTaskId,
                   draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
                   toggleSelected: props.toggleSelected,
                   toggleRange: props.toggleRange,
                   onOpen: props.onOpen,
+                  onFocus: props.onFocus,
                 });
               }),
       ),
@@ -2599,6 +2899,7 @@
       }
     };
     const handleClick = function (e) {
+      if (props.onFocus) props.onFocus(t.id);
       if (e.shiftKey) {
         e.preventDefault();
         e.stopPropagation();
@@ -2635,6 +2936,7 @@
       className: cn(
         "hermes-kanban-card",
         props.selected ? "hermes-kanban-card--selected" : "",
+        props.focused ? "hermes-kanban-card--focused" : "",
         props.failed ? "hermes-kanban-card--failed" : "",
         props.draggingSource ? "hermes-kanban-card--dragging-source" : "",
         stalenessClass(t),
@@ -3148,11 +3450,42 @@
         });
     };
 
+    const drawerW = props.drawerWidth || readDrawerWidth();
+    const onResizeDown = function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      const startX = e.clientX;
+      const startW = drawerW;
+      const handle = e.currentTarget;
+      handle.classList.add("is-active");
+      function onMove(ev) {
+        const dx = startX - ev.clientX; // drag left edge: move left => wider
+        const next = Math.max(420, Math.min(960, startW + dx));
+        if (props.onDrawerWidth) props.onDrawerWidth(next);
+      }
+      function onUp() {
+        handle.classList.remove("is-active");
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      }
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    };
+
     return h("div", { className: "hermes-kanban-drawer-shade", onClick: props.onClose },
       h("div", {
         className: "hermes-kanban-drawer",
+        style: { width: "min(" + drawerW + "px, 94vw)", ["--hermes-kanban-drawer-width"]: drawerW + "px" },
         onClick: function (e) { e.stopPropagation(); },
       },
+        h("div", {
+          className: "hermes-kanban-drawer-resize",
+          title: "Drag to resize",
+          onMouseDown: onResizeDown,
+          role: "separator",
+          "aria-orientation": "vertical",
+          "aria-label": "Resize task drawer",
+        }),
         h("div", { className: "hermes-kanban-drawer-head" },
           h("span", { className: "text-xs text-muted-foreground" }, props.taskId),
           h("button", {
