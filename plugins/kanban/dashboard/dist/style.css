@@ -2825,3 +2825,409 @@
   letter-spacing: normal !important;
   text-transform: none !important;
 }
+
+/* ===== HERMES KANBAN — CREATE COMPOSER v1 ==============================
+ * Linear-ish issue compose panel. Progressive disclosure, Inter type,
+ * clear primary action. Replaces the old wall of tiny inputs.
+ * ====================================================================== */
+
+.hermes-kanban-create {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  margin: 0.15rem 0 0.55rem;
+  padding: 0.75rem 0.8rem 0.7rem;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, #7170ff 35%, rgba(255,255,255,0.08));
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, #7170ff 7%, var(--color-card, #141516)) 0%,
+      color-mix(in srgb, var(--color-card, #121314) 96%, #000) 100%);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, #7170ff 12%, transparent),
+    0 10px 28px rgba(0,0,0,0.28);
+  animation: hermes-kanban-create-in 140ms ease-out;
+}
+@keyframes hermes-kanban-create-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.hermes-kanban-create-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.hermes-kanban-create-head-left {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+.hermes-kanban-create-kicker {
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.02em !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 50%, transparent) !important;
+  text-transform: none !important;
+}
+.hermes-kanban-create-col-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  padding: 0.12rem 0.45rem 0.12rem 0.35rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, #fff 8%, transparent);
+  background: color-mix(in srgb, #fff 4%, transparent);
+  color: color-mix(in srgb, var(--color-foreground, #fff) 78%, transparent) !important;
+}
+.hermes-kanban-create-close {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 45%, transparent);
+  font-size: 1.15rem !important;
+  line-height: 1;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 400 !important;
+}
+.hermes-kanban-create-close:hover {
+  color: var(--color-foreground, #fff);
+  background: color-mix(in srgb, #fff 6%, transparent);
+}
+
+.hermes-kanban-create-title {
+  width: 100%;
+  appearance: none;
+  border: 0 !important;
+  background: transparent !important;
+  outline: none !important;
+  box-shadow: none !important;
+  font-size: 15px !important;
+  font-weight: 560 !important;
+  letter-spacing: -0.02em !important;
+  line-height: 1.35 !important;
+  color: var(--color-foreground, #f4f5f6) !important;
+  padding: 0.15rem 0 !important;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+}
+.hermes-kanban-create-title::placeholder {
+  color: color-mix(in srgb, var(--color-foreground, #fff) 32%, transparent) !important;
+  font-weight: 450 !important;
+}
+
+.hermes-kanban-create-body {
+  width: 100%;
+  appearance: none;
+  border: 1px solid color-mix(in srgb, #fff 8%, transparent) !important;
+  background: color-mix(in srgb, #000 22%, transparent) !important;
+  border-radius: 8px !important;
+  padding: 0.55rem 0.65rem !important;
+  font-size: 13px !important;
+  font-weight: 400 !important;
+  line-height: 1.45 !important;
+  color: var(--color-foreground, #eaecef) !important;
+  resize: vertical;
+  min-height: 4.2rem;
+  max-height: 10rem;
+  outline: none !important;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+}
+.hermes-kanban-create-body:focus {
+  border-color: color-mix(in srgb, #7170ff 45%, transparent) !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #7170ff 14%, transparent);
+}
+.hermes-kanban-create-body::placeholder {
+  color: color-mix(in srgb, var(--color-foreground, #fff) 35%, transparent) !important;
+}
+
+.hermes-kanban-create-add-body {
+  appearance: none;
+  align-self: flex-start;
+  border: 0;
+  background: transparent;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 48%, transparent);
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  padding: 0.15rem 0;
+  cursor: pointer;
+  font-family: inherit !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+.hermes-kanban-create-add-body:hover {
+  color: color-mix(in srgb, #7170ff 70%, #fff);
+}
+
+.hermes-kanban-create-section,
+.hermes-kanban-create-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem 0.65rem;
+  align-items: flex-end;
+}
+.hermes-kanban-create-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  min-width: 8.5rem;
+  flex: 1 1 8.5rem;
+}
+.hermes-kanban-create-field--grow {
+  flex: 2 1 12rem;
+}
+.hermes-kanban-create-label {
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.01em !important;
+  text-transform: none !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 48%, transparent) !important;
+}
+
+.hermes-kanban-create-input,
+.hermes-kanban-create-select {
+  width: 100%;
+  height: 32px !important;
+  border-radius: 7px !important;
+  border: 1px solid color-mix(in srgb, #fff 9%, transparent) !important;
+  background: color-mix(in srgb, #000 28%, transparent) !important;
+  color: var(--color-foreground, #f0f1f2) !important;
+  font-size: 12.5px !important;
+  font-weight: 400 !important;
+  padding: 0 0.55rem !important;
+  outline: none !important;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+}
+.hermes-kanban-create-input:focus,
+.hermes-kanban-create-select:focus {
+  border-color: color-mix(in srgb, #7170ff 50%, transparent) !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #7170ff 14%, transparent);
+}
+.hermes-kanban-create-input--mt { margin-top: 0.35rem; }
+.hermes-kanban-create-input--narrow {
+  max-width: 11rem;
+  margin-top: 0.4rem;
+}
+
+.hermes-kanban-create-chips {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0.3rem;
+  align-items: center;
+}
+.hermes-kanban-create-chips--wrap {
+  flex-wrap: wrap;
+}
+.hermes-kanban-create-chip {
+  appearance: none;
+  border: 1px solid color-mix(in srgb, #fff 9%, transparent);
+  background: color-mix(in srgb, #fff 3%, transparent);
+  color: color-mix(in srgb, var(--color-foreground, #fff) 72%, transparent);
+  border-radius: 999px;
+  padding: 0.28rem 0.65rem;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+  cursor: pointer;
+  line-height: 1.2;
+  font-family: inherit !important;
+  transition: background 100ms ease, border-color 100ms ease, color 100ms ease;
+}
+.hermes-kanban-create-chip:hover {
+  border-color: color-mix(in srgb, #fff 16%, transparent);
+  color: var(--color-foreground, #fff);
+}
+.hermes-kanban-create-chip.is-active {
+  background: color-mix(in srgb, #7170ff 22%, transparent);
+  border-color: color-mix(in srgb, #7170ff 50%, transparent);
+  color: #eef0ff;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #7170ff 25%, transparent);
+}
+.hermes-kanban-create-chip.is-urgent.is-active {
+  background: color-mix(in srgb, #ef4444 22%, transparent);
+  border-color: color-mix(in srgb, #ef4444 50%, transparent);
+  color: #ffe8e8;
+}
+
+.hermes-kanban-create-advanced-toggle {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0;
+  cursor: pointer;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 55%, transparent) !important;
+  font-family: inherit !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+.hermes-kanban-create-advanced-toggle:hover,
+.hermes-kanban-create-advanced-toggle.is-open {
+  color: color-mix(in srgb, var(--color-foreground, #fff) 85%, transparent) !important;
+}
+.hermes-kanban-create-advanced-hint {
+  font-size: 11px !important;
+  font-weight: 400 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 32%, transparent) !important;
+  margin-left: 0.15rem;
+}
+
+.hermes-kanban-create-advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  padding: 0.65rem 0.7rem;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, #fff 6%, transparent);
+  background: color-mix(in srgb, #000 18%, transparent);
+}
+
+.hermes-kanban-create-help {
+  font-size: 11px !important;
+  font-weight: 400 !important;
+  line-height: 1.35 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 40%, transparent) !important;
+}
+
+.hermes-kanban-create-goal {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding-top: 0.15rem;
+  border-top: 1px solid color-mix(in srgb, #fff 5%, transparent);
+}
+.hermes-kanban-create-goal-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+.hermes-kanban-create-checkbox {
+  margin-top: 0.2rem;
+  width: 14px;
+  height: 14px;
+  accent-color: #7170ff;
+  flex-shrink: 0;
+}
+.hermes-kanban-create-goal-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+.hermes-kanban-create-goal-title {
+  font-size: 12.5px !important;
+  font-weight: 560 !important;
+  color: var(--color-foreground, #f0f1f2) !important;
+}
+.hermes-kanban-create-goal-desc {
+  font-size: 11px !important;
+  font-weight: 400 !important;
+  line-height: 1.35 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 42%, transparent) !important;
+}
+
+.hermes-kanban-create-error {
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  color: #fca5a5 !important;
+  background: color-mix(in srgb, #ef4444 12%, transparent);
+  border: 1px solid color-mix(in srgb, #ef4444 30%, transparent);
+  border-radius: 7px;
+  padding: 0.4rem 0.55rem;
+}
+
+.hermes-kanban-create-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding-top: 0.2rem;
+  flex-wrap: wrap;
+}
+.hermes-kanban-create-kbd-hint {
+  font-size: 11px !important;
+  font-weight: 400 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 38%, transparent) !important;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  flex-wrap: wrap;
+}
+.hermes-kanban-create-kbd-hint kbd {
+  font-family: "JetBrains Mono", ui-monospace, monospace !important;
+  font-size: 10px !important;
+  font-weight: 500 !important;
+  border: 1px solid color-mix(in srgb, #fff 10%, transparent);
+  background: color-mix(in srgb, #fff 4%, transparent);
+  border-radius: 4px;
+  padding: 0.05rem 0.28rem;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 65%, transparent);
+}
+.hermes-kanban-create-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+.hermes-kanban-create-btn {
+  appearance: none;
+  border-radius: 7px !important;
+  font-size: 12.5px !important;
+  font-weight: 550 !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+  padding: 0.4rem 0.8rem !important;
+  cursor: pointer;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+  line-height: 1.2;
+  border: 1px solid transparent;
+  transition: background 100ms ease, border-color 100ms ease, opacity 100ms ease;
+}
+.hermes-kanban-create-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.hermes-kanban-create-btn--ghost {
+  background: transparent;
+  border-color: color-mix(in srgb, #fff 10%, transparent);
+  color: color-mix(in srgb, var(--color-foreground, #fff) 75%, transparent);
+}
+.hermes-kanban-create-btn--ghost:hover:not(:disabled) {
+  background: color-mix(in srgb, #fff 5%, transparent);
+  color: var(--color-foreground, #fff);
+}
+.hermes-kanban-create-btn--primary {
+  background: #5e6ad2;
+  border-color: #5e6ad2;
+  color: #fff !important;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.08) inset, 0 1px 2px rgba(0,0,0,0.25);
+}
+.hermes-kanban-create-btn--primary:hover:not(:disabled) {
+  background: #6b76e0;
+  border-color: #6b76e0;
+}
+
+/* Hide legacy inline-create chrome if any residual class remains */
+.hermes-kanban-inline-create {
+  display: none !important;
+}
+
+/* Column + button looks like a real affordance when create is open */
+.hermes-kanban-column-add {
+  font-weight: 400 !important;
+}

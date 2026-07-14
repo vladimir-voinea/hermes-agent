@@ -1487,6 +1487,8 @@
           onFocus: setFocusedTaskId,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
+          assignees: (boardData && boardData.assignees) || [],
+          tenants: (boardData && boardData.tenants) || [],
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
@@ -2919,6 +2921,8 @@
           onFocus: props.onFocus,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
+          assignees: props.assignees || [],
+          tenants: props.tenants || [],
         });
       }),
       // Only show trash while a drag is active — otherwise it steals a grid
@@ -3052,8 +3056,10 @@
       showCreate ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
+        assignees: props.assignees || [],
+        tenants: props.tenants || [],
         onSubmit: function (body) {
-          props.onCreate(body).then(function () { setShowCreate(false); });
+          return props.onCreate(body).then(function () { setShowCreate(false); });
         },
         onCancel: function () { setShowCreate(false); },
       }) : null,
@@ -3315,176 +3321,352 @@
   function InlineCreate(props) {
     const { t } = useI18n();
     const [title, setTitle] = useState("");
+    const [body, setBody] = useState("");
     const [assignee, setAssignee] = useState("");
     const [priority, setPriority] = useState(0);
     const [parent, setParent] = useState("");
     const [skills, setSkills] = useState("");
-    // Workspace controls. `scratch` (default) ignores path; `worktree` optionally
-    // takes a path (dispatcher derives one from the assignee profile otherwise);
-    // `dir` requires a path. Backend enforces the rule — we only hide/show the
-    // input here to save vertical space in the common `scratch` case.
+    const [tenant, setTenant] = useState("");
     const [workspaceKind, setWorkspaceKind] = useState("scratch");
     const [workspacePath, setWorkspacePath] = useState("");
-    // Goal-mode: when on, the dispatched worker runs the Ralph-style /goal
-    // loop — a judge re-checks the card after each turn and the worker keeps
-    // going in the same session until done, or the turn budget runs out
-    // (which blocks the card for review). goalMaxTurns is optional; blank
-    // = backend default.
     const [goalMode, setGoalMode] = useState(false);
     const [goalMaxTurns, setGoalMaxTurns] = useState("");
+    const [showAdvanced, setShowAdvanced] = useState(false);
+    const [showBody, setShowBody] = useState(false);
+    const [busy, setBusy] = useState(false);
+    const [err, setErr] = useState(null);
+    const titleRef = useRef(null);
+
+    useEffect(function () {
+      // Focus title on mount
+      const el = titleRef.current || document.querySelector(".hermes-kanban-create-title");
+      if (el && el.focus) {
+        requestAnimationFrame(function () { el.focus(); });
+      }
+    }, []);
+
+    const assignees = props.assignees || [];
+    const tenants = props.tenants || [];
+    const colLabel = getColumnLabel(t, props.columnName) || props.columnName;
+    const isTriage = props.columnName === "triage";
+
+    const PRIORITIES = [
+      { v: 0, label: "Normal" },
+      { v: 1, label: "P1" },
+      { v: 2, label: "P2" },
+      { v: 5, label: "P5" },
+      { v: 10, label: "Urgent" },
+    ];
+
+    const WORKSPACES = [
+      { v: "scratch", label: "Scratch", hint: "Isolated temp dir — deleted after the task finishes" },
+      { v: "worktree", label: "Worktree", hint: "Git worktree for coding tasks" },
+      { v: "dir", label: "Directory", hint: "Existing absolute path on disk" },
+    ];
 
     const submit = function () {
       const trimmed = title.trim();
-      if (!trimmed) return;
-      const body = {
+      if (!trimmed || busy) return;
+      if (workspaceKind === "dir" && !workspacePath.trim()) {
+        setErr("Directory workspace needs an absolute path.");
+        setShowAdvanced(true);
+        return;
+      }
+      setBusy(true);
+      setErr(null);
+      const payload = {
         title: trimmed,
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
-        triage: props.columnName === "triage",
+        triage: isTriage,
       };
-      if (parent) body.parents = [parent];
-      // Parse comma-separated skills into a clean list. Blank = no
-      // extras (omit key so backend leaves it null). The dispatcher
-      // always auto-loads kanban-worker; these are extras on top.
+      const bodyTrim = body.trim();
+      if (bodyTrim) payload.body = bodyTrim;
+      if (parent) payload.parents = [parent];
+      if (tenant.trim()) payload.tenant = tenant.trim();
       const skillList = skills
         .split(",")
         .map(function (s) { return s.trim(); })
         .filter(function (s) { return s.length > 0; });
-      if (skillList.length > 0) body.skills = skillList;
-      // Only send workspace_kind when it's non-default. Keeps the request
-      // shape small and interoperable with older dispatcher versions.
+      if (skillList.length > 0) payload.skills = skillList;
       if (workspaceKind && workspaceKind !== "scratch") {
-        body.workspace_kind = workspaceKind;
+        payload.workspace_kind = workspaceKind;
       }
       const wpTrim = workspacePath.trim();
-      if (wpTrim) body.workspace_path = wpTrim;
-      // Goal-mode toggle. Only send the keys when enabled so the request
-      // shape stays small and old dispatchers ignore it cleanly.
+      if (wpTrim) payload.workspace_path = wpTrim;
       if (goalMode) {
-        body.goal_mode = true;
+        payload.goal_mode = true;
         const gmt = parseInt(goalMaxTurns, 10);
-        if (Number.isFinite(gmt) && gmt > 0) body.goal_max_turns = gmt;
+        if (Number.isFinite(gmt) && gmt > 0) payload.goal_max_turns = gmt;
       }
-      props.onSubmit(body);
-      setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
-      setWorkspaceKind("scratch"); setWorkspacePath("");
-      setGoalMode(false); setGoalMaxTurns("");
+      Promise.resolve(props.onSubmit(payload))
+        .then(function () {
+          setTitle(""); setBody(""); setAssignee(""); setPriority(0);
+          setParent(""); setSkills(""); setTenant("");
+          setWorkspaceKind("scratch"); setWorkspacePath("");
+          setGoalMode(false); setGoalMaxTurns("");
+          setShowAdvanced(false); setShowBody(false);
+        })
+        .catch(function (e) {
+          setErr(parseApiErrorMessage(e) || String(e.message || e));
+        })
+        .finally(function () { setBusy(false); });
+    };
+
+    const onKeyDown = function (e) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        props.onCancel();
+        return;
+      }
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        submit();
+      }
     };
 
     const showPathInput = workspaceKind !== "scratch";
-    const pathPlaceholder = workspaceKind === "dir"
-      ? tx(t, "workspacePathDir", "workspace path (required, e.g. ~/projects/my-app)")
-      : tx(t, "workspacePathOptional",
-          "workspace path (optional, derived from assignee if blank)");
+    const parentTasks = (props.allTasks || []).filter(function (task) {
+      return task && task.id && task.status !== "archived";
+    });
 
-    return h("div", { className: "hermes-kanban-inline-create" },
-      h("textarea", {
+    return h("div", {
+      className: "hermes-kanban-create",
+      onKeyDown: onKeyDown,
+      onClick: function (e) { e.stopPropagation(); },
+    },
+      // Header
+      h("div", { className: "hermes-kanban-create-head" },
+        h("div", { className: "hermes-kanban-create-head-left" },
+          h("span", { className: "hermes-kanban-create-kicker" }, "New task"),
+          h("span", {
+            className: "hermes-kanban-create-col-pill",
+            title: "Lands in this column",
+          },
+            h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[props.columnName] || "") }),
+            colLabel,
+          ),
+        ),
+        h("button", {
+          type: "button",
+          className: "hermes-kanban-create-close",
+          onClick: props.onCancel,
+          "aria-label": "Close",
+          title: "Close (Esc)",
+        }, "×"),
+      ),
+
+      // Title
+      h("input", {
+        ref: titleRef,
+        className: "hermes-kanban-create-title",
         value: title,
         onChange: function (e) { setTitle(e.target.value); },
-        onKeyDown: function (e) {
-          if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
-          if (e.key === "Escape") props.onCancel();
-        },
-        placeholder: props.columnName === "triage"
-          ? tx(t, "triagePlaceholder", "Rough idea — AI will spec it…")
-          : tx(t, "taskTitlePlaceholder", "New task title…"),
+        placeholder: isTriage
+          ? "Rough idea — a specifier will flesh out the spec…"
+          : "Task title",
         autoFocus: true,
-        className: "text-sm min-h-[2rem] max-h-32 resize-y w-full border border-input bg-transparent px-2 py-1 rounded-md focus:outline-none focus:ring-2 focus:ring-ring",
-        rows: 2,
+        spellCheck: true,
       }),
-      h("div", { className: "flex gap-2" },
-        h(Input, {
-          value: assignee,
-          onChange: function (e) { setAssignee(e.target.value); },
-          placeholder: props.columnName === "triage"
-            ? tx(t, "specifier", "specifier")
-            : tx(t, "assigneePlaceholder", "assignee"),
-          className: "h-7 text-xs flex-1",
-          title: props.columnName === "triage"
-            ? "Hermes profile that will spec this task (default: the dispatcher's configured specifier). Leave blank to let the dispatcher pick."
-            : "Hermes profile to assign. Leave blank and the dispatcher will pick from available profiles when the task is Ready.",
-          style: { textTransform: "none" },
-          autoCapitalize: "none",
-          autoCorrect: "off",
-          spellCheck: false,
-        }),
-        h(Input, {
-          type: "number",
-          value: priority,
-          onChange: function (e) { setPriority(e.target.value); },
-          placeholder: "pri",
-          className: "h-7 text-xs w-16",
-          title: "Priority. Higher-priority tasks are claimed first by the dispatcher. 0 = default.",
-        }),
-      ),
-      h(Input, {
-        value: skills,
-        onChange: function (e) { setSkills(e.target.value); },
-        placeholder: tx(t, "skillsPlaceholder",
-          "skills (optional, comma-separated): translation, github-code-review"),
-        title: "Force-load these skills into the worker (in addition to the built-in kanban-worker).",
-        className: "h-7 text-xs",
-      }),
-      h("div", { className: "flex gap-2 items-center" },
-        h("label", {
-          className: "flex items-center gap-1.5 text-xs cursor-pointer select-none",
-          title: "Goal mode: the worker keeps going in the same session until a judge agrees the card is done (or the turn budget runs out, which blocks it for review). Best for open-ended cards one shot rarely finishes.",
-        },
-          h("input", {
-            type: "checkbox",
-            checked: goalMode,
-            onChange: function (e) { setGoalMode(!!e.target.checked); },
-            className: "h-3.5 w-3.5 accent-current",
-          }),
-          tx(t, "goalMode", "goal mode"),
+
+      // Description (progressive)
+      showBody
+        ? h("textarea", {
+            className: "hermes-kanban-create-body",
+            value: body,
+            onChange: function (e) { setBody(e.target.value); },
+            placeholder: "Description, acceptance criteria, links… (optional)",
+            rows: 3,
+          })
+        : h("button", {
+            type: "button",
+            className: "hermes-kanban-create-add-body",
+            onClick: function () { setShowBody(true); },
+          }, "+ Add description"),
+
+      // Primary row: assignee + priority
+      h("div", { className: "hermes-kanban-create-section" },
+        h("div", { className: "hermes-kanban-create-field" },
+          h("label", { className: "hermes-kanban-create-label" },
+            isTriage ? "Specifier profile" : "Assignee"),
+          assignees.length
+            ? h(Select, Object.assign({
+                value: assignee,
+                className: "hermes-kanban-create-select",
+                title: isTriage
+                  ? "Profile that will flesh out this triage idea"
+                  : "Hermes profile that will run this task",
+              }, selectChangeHandler(setAssignee)),
+                h(SelectOption, { value: "" }, isTriage ? "Auto (dispatcher)" : "Unassigned"),
+                assignees.map(function (a) {
+                  return h(SelectOption, { key: a, value: a }, "@" + a);
+                }),
+              )
+            : h("input", {
+                className: "hermes-kanban-create-input",
+                value: assignee,
+                onChange: function (e) { setAssignee(e.target.value); },
+                placeholder: "profile name",
+                spellCheck: false,
+                autoCapitalize: "none",
+                autoCorrect: "off",
+              }),
         ),
-        goalMode ? h(Input, {
-          type: "number",
-          value: goalMaxTurns,
-          onChange: function (e) { setGoalMaxTurns(e.target.value); },
-          placeholder: tx(t, "goalMaxTurns", "max turns (default 20)"),
-          className: "h-7 text-xs w-40",
-          title: "Turn budget for the goal loop. Blank = backend default (20).",
-          min: 1,
-        }) : null,
-      ),
-      h("div", { className: "flex gap-2" },
-        h(Select, Object.assign({
-          value: workspaceKind,
-          title: "scratch: isolated temp dir (default). worktree: git worktree on the assignee profile. dir: exact path (required below).",
-          className: "h-7 text-xs w-28",
-        }, selectChangeHandler(setWorkspaceKind)),
-          h(SelectOption, { value: "scratch" }, "scratch"),
-          h(SelectOption, { value: "worktree" }, "worktree"),
-          h(SelectOption, { value: "dir" }, "dir"),
+        h("div", { className: "hermes-kanban-create-field hermes-kanban-create-field--grow" },
+          h("label", { className: "hermes-kanban-create-label" }, "Priority"),
+          h("div", { className: "hermes-kanban-create-chips", role: "group", "aria-label": "Priority" },
+            PRIORITIES.map(function (p) {
+              return h("button", {
+                key: p.v,
+                type: "button",
+                className: "hermes-kanban-create-chip" + (Number(priority) === p.v ? " is-active" : "") + (p.v >= 10 ? " is-urgent" : ""),
+                onClick: function () { setPriority(p.v); },
+                title: p.v === 0 ? "Default priority" : "Priority " + p.v + " — higher is claimed first",
+              }, p.label);
+            }),
+          ),
         ),
-        showPathInput ? h(Input, {
-          value: workspacePath,
-          onChange: function (e) { setWorkspacePath(e.target.value); },
-          placeholder: pathPlaceholder,
-          className: "h-7 text-xs flex-1",
-        }) : null,
       ),
-      h(Select, Object.assign({
-        value: parent,
-        className: "h-7 text-xs",
-        title: "Optional parent task. A child stays blocked in its current column until the parent is marked done.",
-      }, selectChangeHandler(setParent)),
-        h(SelectOption, { value: "" }, tx(t, "noParent", "— no parent —")),
-        (props.allTasks || []).map(function (task) {
-          return h(SelectOption, { key: task.id, value: task.id },
-            `${task.id} — ${(task.title || "").slice(0, 50)}`);
-        }),
+
+      // Advanced toggle
+      h("button", {
+        type: "button",
+        className: "hermes-kanban-create-advanced-toggle" + (showAdvanced ? " is-open" : ""),
+        onClick: function () { setShowAdvanced(function (v) { return !v; }); },
+        "aria-expanded": showAdvanced ? "true" : "false",
+      },
+        h("span", null, showAdvanced ? "▾" : "▸"),
+        " More options",
+        h("span", { className: "hermes-kanban-create-advanced-hint" },
+          "workspace · parent · skills · goal mode"),
       ),
-      h("div", { className: "flex gap-2" },
-        h(Button, {
-          onClick: submit,
-          size: "sm",
-        }, "Create"),
-        h(Button, {
-          onClick: props.onCancel,
-          size: "sm",
-        }, tx(t, "cancel", "Cancel")),
+
+      showAdvanced ? h("div", { className: "hermes-kanban-create-advanced" },
+        // Workspace
+        h("div", { className: "hermes-kanban-create-field" },
+          h("label", { className: "hermes-kanban-create-label" }, "Workspace"),
+          h("div", { className: "hermes-kanban-create-chips hermes-kanban-create-chips--wrap" },
+            WORKSPACES.map(function (w) {
+              return h("button", {
+                key: w.v,
+                type: "button",
+                className: "hermes-kanban-create-chip" + (workspaceKind === w.v ? " is-active" : ""),
+                onClick: function () { setWorkspaceKind(w.v); },
+                title: w.hint,
+              }, w.label);
+            }),
+          ),
+          h("div", { className: "hermes-kanban-create-help" },
+            (WORKSPACES.find(function (w) { return w.v === workspaceKind; }) || {}).hint || ""),
+          showPathInput ? h("input", {
+            className: "hermes-kanban-create-input hermes-kanban-create-input--mt",
+            value: workspacePath,
+            onChange: function (e) { setWorkspacePath(e.target.value); },
+            placeholder: workspaceKind === "dir"
+              ? "/absolute/path (required)"
+              : "path optional — derived from assignee if blank",
+            spellCheck: false,
+          }) : null,
+        ),
+
+        // Parent
+        h("div", { className: "hermes-kanban-create-field" },
+          h("label", { className: "hermes-kanban-create-label" }, "Depends on"),
+          h(Select, Object.assign({
+            value: parent,
+            className: "hermes-kanban-create-select",
+            title: "Child stays blocked until this parent is done",
+          }, selectChangeHandler(setParent)),
+            h(SelectOption, { value: "" }, "No dependency"),
+            parentTasks.map(function (task) {
+              return h(SelectOption, { key: task.id, value: task.id },
+                task.id + " — " + ((task.title || "").slice(0, 48)));
+            }),
+          ),
+        ),
+
+        // Skills + tenant
+        h("div", { className: "hermes-kanban-create-row" },
+          h("div", { className: "hermes-kanban-create-field hermes-kanban-create-field--grow" },
+            h("label", { className: "hermes-kanban-create-label" }, "Extra skills"),
+            h("input", {
+              className: "hermes-kanban-create-input",
+              value: skills,
+              onChange: function (e) { setSkills(e.target.value); },
+              placeholder: "comma-separated, e.g. github-code-review",
+              title: "Loaded in addition to kanban-worker",
+              spellCheck: false,
+            }),
+          ),
+          tenants.length || true ? h("div", { className: "hermes-kanban-create-field" },
+            h("label", { className: "hermes-kanban-create-label" }, "Tenant"),
+            tenants.length
+              ? h(Select, Object.assign({
+                  value: tenant,
+                  className: "hermes-kanban-create-select",
+                }, selectChangeHandler(setTenant)),
+                  h(SelectOption, { value: "" }, "None"),
+                  tenants.map(function (tn) {
+                    return h(SelectOption, { key: tn, value: tn }, tn);
+                  }),
+                )
+              : h("input", {
+                  className: "hermes-kanban-create-input",
+                  value: tenant,
+                  onChange: function (e) { setTenant(e.target.value); },
+                  placeholder: "optional tag",
+                  spellCheck: false,
+                }),
+          ) : null,
+        ),
+
+        // Goal mode
+        h("div", { className: "hermes-kanban-create-goal" },
+          h("label", { className: "hermes-kanban-create-goal-row" },
+            h("input", {
+              type: "checkbox",
+              checked: goalMode,
+              onChange: function (e) { setGoalMode(!!e.target.checked); },
+              className: "hermes-kanban-create-checkbox",
+            }),
+            h("span", { className: "hermes-kanban-create-goal-text" },
+              h("span", { className: "hermes-kanban-create-goal-title" }, "Goal mode"),
+              h("span", { className: "hermes-kanban-create-goal-desc" },
+                "Worker keeps going until a judge agrees it’s done (or budget runs out)"),
+            ),
+          ),
+          goalMode ? h("input", {
+            type: "number",
+            className: "hermes-kanban-create-input hermes-kanban-create-input--narrow",
+            value: goalMaxTurns,
+            onChange: function (e) { setGoalMaxTurns(e.target.value); },
+            placeholder: "Max turns (default 20)",
+            min: 1,
+          }) : null,
+        ),
+      ) : null,
+
+      err ? h("div", { className: "hermes-kanban-create-error" }, err) : null,
+
+      // Footer
+      h("div", { className: "hermes-kanban-create-foot" },
+        h("span", { className: "hermes-kanban-create-kbd-hint" },
+          h("kbd", null, "⌘"), h("kbd", null, "↵"), " create · ",
+          h("kbd", null, "esc"), " cancel"),
+        h("div", { className: "hermes-kanban-create-actions" },
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-create-btn hermes-kanban-create-btn--ghost",
+            onClick: props.onCancel,
+            disabled: busy,
+          }, "Cancel"),
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-create-btn hermes-kanban-create-btn--primary",
+            onClick: submit,
+            disabled: busy || !title.trim(),
+          }, busy ? "Creating…" : "Create task"),
+        ),
       ),
     );
   }
