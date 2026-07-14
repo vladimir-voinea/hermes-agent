@@ -16476,12 +16476,26 @@ def main(
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
                         cli.agent.tool_args_callback = None
+                        # Kanban worker: bridge live operator comments left on
+                        # this card into the running loop as steers, so mid-run
+                        # feedback lands without a block/unblock cycle. No-op for
+                        # every non-kanban `-q` run. See agent.kanban_steer_watcher.
+                        _kanban_steer_watcher = None
+                        try:
+                            from agent.kanban_steer_watcher import (
+                                start_comment_steer_watcher as _start_kanban_steer,
+                            )
+                            _kanban_steer_watcher = _start_kanban_steer(cli.agent)
+                        except Exception:
+                            _kanban_steer_watcher = None
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
                             )
                         except KeyboardInterrupt:
+                            if _kanban_steer_watcher is not None:
+                                _kanban_steer_watcher.stop()
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
@@ -16521,6 +16535,11 @@ def main(
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+
+                        # Worker loop is done — stop the live comment-steer
+                        # watcher so it can't inject after the final turn.
+                        if _kanban_steer_watcher is not None:
+                            _kanban_steer_watcher.stop()
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
