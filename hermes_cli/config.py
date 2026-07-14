@@ -4713,7 +4713,7 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
-        "ssl_ca_cert", "ssl_verify",
+        "ssl_ca_cert", "ssl_verify", "reasoning_control",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -4838,6 +4838,13 @@ def _normalize_custom_provider_entry(
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
 
+    # Per-provider reasoning lever: maps Hermes' /reasoning (none/effort)
+    # onto this engine's native knobs (chat_template_kwargs.enable_thinking +
+    # top-level reasoning_effort). See agent_init._custom_provider_reasoning_control_for_agent.
+    reasoning_control = entry.get("reasoning_control")
+    if isinstance(reasoning_control, dict) and reasoning_control:
+        normalized["reasoning_control"] = dict(reasoning_control)
+
     # Per-provider extra HTTP headers (proxies, gateways, custom auth).
     # Values may carry credentials (e.g. CF-Access-Client-Secret) — never
     # log them anywhere downstream.
@@ -4883,6 +4890,7 @@ def _custom_provider_entry_to_provider_config(
         "discover_models",
         "extra_body",
         "extra_headers",
+        "reasoning_control",
         "ssl_ca_cert",
         "ssl_verify",
     ):

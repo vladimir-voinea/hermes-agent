@@ -238,6 +238,59 @@ def _custom_provider_extra_body_for_agent(
     return fallback
 
 
+def _custom_provider_reasoning_control_for_agent(
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    custom_providers: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Resolve the per-provider ``reasoning_control`` block for a custom endpoint.
+
+    Same base-url match as ``_custom_provider_extra_body_for_agent`` (the runtime
+    provider is the bare string ``custom``), but returns the provider's
+    ``reasoning_control`` dict — the declarative map from Hermes' /reasoning lever
+    onto this engine's native thinking knobs. Prefers an entry whose ``model``
+    matches; otherwise the first entry at the URL that carries a non-empty block.
+    """
+    provider_norm = (provider or "").strip().lower()
+    if provider_norm == "custom":
+        provider_key_filter = ""
+    elif provider_norm.startswith("custom:"):
+        provider_key_filter = provider_norm.split(":", 1)[1].strip()
+    else:
+        return None
+
+    target_url = _normalized_custom_base_url(base_url)
+    if not target_url:
+        return None
+
+    fallback: Optional[Dict[str, Any]] = None
+    for entry in custom_providers or []:
+        if not isinstance(entry, dict):
+            continue
+        if provider_key_filter:
+            entry_keys = {
+                str(entry.get("provider_key", "") or "").strip().lower(),
+                str(entry.get("name", "") or "").strip().lower(),
+            }
+            if provider_key_filter not in entry_keys:
+                continue
+        if _normalized_custom_base_url(entry.get("base_url")) != target_url:
+            continue
+        control = entry.get("reasoning_control")
+        if not isinstance(control, dict) or not control:
+            continue
+        provider_model = str(entry.get("model", "") or "").strip()
+        if provider_model:
+            if _custom_provider_model_matches(model, entry):
+                return dict(control)
+        elif fallback is None:
+            fallback = dict(control)
+
+    return fallback
+
+
 def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
     extra_body = _custom_provider_extra_body_for_agent(
         provider=agent.provider,
@@ -1666,6 +1719,16 @@ def init_agent(
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
     _merge_custom_provider_extra_body(agent, _custom_providers)
+
+    # Resolve the per-provider reasoning lever (opt-in ``reasoning_control``
+    # block). Consumed per-request by the chat_completions transport so the
+    # runtime /reasoning level drives this engine's native thinking knobs.
+    agent._reasoning_control = _custom_provider_reasoning_control_for_agent(
+        provider=agent.provider,
+        model=agent.model,
+        base_url=agent.base_url,
+        custom_providers=_custom_providers,
+    )
 
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:
