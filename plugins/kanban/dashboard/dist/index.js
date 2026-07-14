@@ -229,9 +229,9 @@
   function readDrawerWidth() {
     try {
       const n = Number(localStorage.getItem(DRAWER_WIDTH_KEY));
-      if (Number.isFinite(n) && n >= 420 && n <= 960) return n;
+      if (Number.isFinite(n) && n >= 720 && n <= 1400) return n;
     } catch (e) {}
-    return 680;
+    return 1080;
   }
   function writeDrawerWidth(n) {
     try { localStorage.setItem(DRAWER_WIDTH_KEY, String(n)); } catch (e) {}
@@ -3953,7 +3953,7 @@
       handle.classList.add("is-active");
       function onMove(ev) {
         const dx = startX - ev.clientX; // drag left edge: move left => wider
-        const next = Math.max(420, Math.min(960, startW + dx));
+        const next = Math.max(720, Math.min(1400, startW + dx));
         if (props.onDrawerWidth) props.onDrawerWidth(next);
       }
       function onUp() {
@@ -3965,11 +3965,21 @@
       window.addEventListener("mouseup", onUp);
     };
 
-    return h("div", { className: "hermes-kanban-drawer-shade", onClick: props.onClose },
+    const taskStatus = data && data.task ? data.task.status : null;
+    return h("div", {
+      className: "hermes-kanban-drawer-shade hermes-kanban-detail-shade",
+      onClick: props.onClose,
+    },
       h("div", {
-        className: "hermes-kanban-drawer",
-        style: { width: "min(" + drawerW + "px, 94vw)", ["--hermes-kanban-drawer-width"]: drawerW + "px" },
+        className: "hermes-kanban-drawer hermes-kanban-detail",
+        style: {
+          width: "min(" + drawerW + "px, 96vw)",
+          ["--hermes-kanban-drawer-width"]: drawerW + "px",
+        },
         onClick: function (e) { e.stopPropagation(); },
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": "Task detail",
       },
         h("div", {
           className: "hermes-kanban-drawer-resize",
@@ -3977,20 +3987,33 @@
           onMouseDown: onResizeDown,
           role: "separator",
           "aria-orientation": "vertical",
-          "aria-label": "Resize task drawer",
+          "aria-label": "Resize task panel",
         }),
-        h("div", { className: "hermes-kanban-drawer-head" },
-          h("span", { className: "text-xs text-muted-foreground" }, props.taskId),
+        h("div", { className: "hermes-kanban-detail-head" },
+          h("div", { className: "hermes-kanban-detail-head-left" },
+            h("span", { className: "hermes-kanban-detail-id" }, props.taskId),
+            taskStatus
+              ? h("span", {
+                  className: "hermes-kanban-detail-status-pill",
+                },
+                  h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[taskStatus] || "") }),
+                  taskStatus,
+                )
+              : null,
+          ),
           h("button", {
             type: "button",
             onClick: props.onClose,
-            className: "hermes-kanban-drawer-close",
+            className: "hermes-kanban-drawer-close hermes-kanban-detail-close",
             title: tx(t, "close", "Close (Esc)"),
           }, "×"),
         ),
-        loading ? h("div", { className: "p-4 text-sm text-muted-foreground" },
+        patchErr
+          ? h("div", { className: "hermes-kanban-detail-banner hermes-kanban-msg-err" }, patchErr)
+          : null,
+        loading ? h("div", { className: "hermes-kanban-detail-loading" },
           tx(t, "loadingDetail", "Loading…")) :
-        err ? h("div", { className: "p-4 text-sm text-destructive" }, err) :
+        err ? h("div", { className: "hermes-kanban-detail-loading hermes-kanban-msg-err" }, err) :
         data ? h(TaskDetail, {
           data, editing, setEditing,
           renderMarkdown: props.renderMarkdown,
@@ -4012,24 +4035,10 @@
           onDeleteAttachment: handleDeleteAttachment,
           uploadBusy: uploadBusy,
           uploadErr: uploadErr,
+          newComment: newComment,
+          setNewComment: setNewComment,
+          onComment: handleComment,
         }) : null,
-        data ? h("div", { className: "hermes-kanban-drawer-comment-row" },
-          h(Input, {
-            value: newComment,
-            onChange: function (e) { setNewComment(e.target.value); },
-            onKeyDown: function (e) {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault(); handleComment();
-              }
-            },
-            placeholder: tx(t, "addComment", "Add a comment… (Enter to submit)"),
-            className: "h-8 text-sm flex-1",
-          }),
-          h(Button, {
-            onClick: handleComment,
-            size: "sm",
-          }, tx(t, "comment", "Comment")),
-        ) : null,
       ),
     );
   }
@@ -4148,8 +4157,9 @@
     const events = props.data.events || [];
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
+    const [showEvents, setShowEvents] = useState(false);
 
-    return h("div", { className: "hermes-kanban-drawer-body" },
+    const issuePane = h("div", { className: "hermes-kanban-detail-main" },
       h("div", { className: "hermes-kanban-drawer-title" },
         h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.status]) }),
         props.editing
@@ -4166,7 +4176,7 @@
               onClick: function () { props.setEditing(true); },
             }, t.title || tx(i18n, "untitled", "(untitled)")),
       ),
-      h("div", { className: "hermes-kanban-drawer-meta" },
+      h("div", { className: "hermes-kanban-detail-props" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
@@ -4218,7 +4228,7 @@
         onAddChild: props.onAddChild,
         onRemoveChild: props.onRemoveChild,
       }),
-      t.result ? h("div", { className: "hermes-kanban-section" },
+      t.result ? h("div", { className: "hermes-kanban-section hermes-kanban-result-block" },
         h("div", { className: "hermes-kanban-section-head" }, tx(i18n, "result", "Result")),
         h(MarkdownBlock, { source: t.result, enabled: props.renderMarkdown }),
       ) : null,
@@ -4231,12 +4241,12 @@
         uploadErr: props.uploadErr,
         i18n: i18n,
       }),
-      h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section hermes-kanban-comments-block" },
         h("div", { className: "hermes-kanban-section-head" },
           `${tx(i18n, "comments", "Comments")} (${comments.length})`),
         comments.length === 0
-          ? h("div", { className: "text-xs text-muted-foreground" },
-              tx(i18n, "noComments", "— no comments —"))
+          ? h("div", { className: "hermes-kanban-muted" },
+              tx(i18n, "noComments", "No comments yet"))
           : comments.map(function (c) {
               return h("div", { key: c.id, className: "hermes-kanban-comment" },
                 h("div", { className: "hermes-kanban-comment-head" },
@@ -4247,54 +4257,95 @@
                 h(MarkdownBlock, { source: c.body, enabled: props.renderMarkdown }),
               );
             }),
+        h("div", { className: "hermes-kanban-comment-compose" },
+          h("textarea", {
+            className: "hermes-kanban-comment-input",
+            value: props.newComment || "",
+            onChange: function (e) {
+              if (props.setNewComment) props.setNewComment(e.target.value);
+            },
+            onKeyDown: function (e) {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                if (props.onComment) props.onComment();
+              }
+            },
+            placeholder: "Write a comment… (⌘↵ to send)",
+            rows: 2,
+          }),
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-create-btn hermes-kanban-create-btn--primary",
+            onClick: function () { if (props.onComment) props.onComment(); },
+            disabled: !(props.newComment || "").trim(),
+          }, "Comment"),
+        ),
       ),
-      h("div", { className: "hermes-kanban-section" },
-        h("div", { className: "hermes-kanban-section-head" },
-          `${tx(i18n, "events", "Events")} (${events.length})`),
-        events.slice().reverse().slice(0, 20).map(function (e) {
-          const isDiag = isDiagnosticEvent(e.kind);
-          const phantoms = isDiag ? phantomIdsFromEvent(e) : [];
-          return h("div", {
-            key: e.id,
-            className: cn(
-              "hermes-kanban-event",
-              isDiag ? "hermes-kanban-event--hallucination" : "",
-            ),
-          },
-            isDiag
-              ? h("div", { className: "hermes-kanban-event-header" },
-                  h("span", { className: "hermes-kanban-event-warning-icon" }, "⚠"),
-                  h("span", { className: "hermes-kanban-event-warning-label" },
-                    getDiagnosticEventLabel(i18n, e.kind) || e.kind),
-                  h("span", { className: "hermes-kanban-event-ago" },
-                    timeAgo ? timeAgo(e.created_at) : ""),
-                )
-              : h("div", { className: "hermes-kanban-event-header-plain" },
-                  h("span", { className: "hermes-kanban-event-kind" }, e.kind),
-                  h("span", { className: "hermes-kanban-event-ago" },
-                    timeAgo ? timeAgo(e.created_at) : ""),
-                ),
-            isDiag && phantoms.length > 0
-              ? h("div", { className: "hermes-kanban-event-phantom-row" },
-                  h("span", { className: "hermes-kanban-event-phantom-label" },
-                    tx(i18n, "phantomIds", "Phantom ids:")),
-                  phantoms.map(function (pid) {
-                    return h("code", {
-                      key: pid,
-                      className: "hermes-kanban-event-phantom-chip",
-                    }, pid);
-                  }),
-                )
-              : null,
-            e.payload && !isDiag
-              ? h("code", { className: "hermes-kanban-event-payload" },
-                  JSON.stringify(e.payload))
-              : null,
-          );
-        }),
-      ),
-      h(WorkerLogSection, { taskId: t.id, boardSlug: props.boardSlug }),
+    );
+
+    const activityPane = h("div", { className: "hermes-kanban-detail-activity" },
+      h(WorkerLogSection, {
+        taskId: t.id,
+        boardSlug: props.boardSlug,
+        live: t.status === "running",
+      }),
       h(RunHistorySection, { runs: props.data.runs || [] }),
+      h("div", { className: "hermes-kanban-section hermes-kanban-events-block" },
+        h("button", {
+          type: "button",
+          className: "hermes-kanban-section-toggle-btn",
+          onClick: function () { setShowEvents(function (v) { return !v; }); },
+        },
+          (showEvents ? "▾ " : "▸ ") + tx(i18n, "events", "Events") + " (" + events.length + ")"),
+        showEvents
+          ? (events.slice().reverse().slice(0, 40).map(function (e) {
+              const isDiag = isDiagnosticEvent(e.kind);
+              const phantoms = isDiag ? phantomIdsFromEvent(e) : [];
+              return h("div", {
+                key: e.id,
+                className: cn(
+                  "hermes-kanban-event",
+                  isDiag ? "hermes-kanban-event--hallucination" : "",
+                ),
+              },
+                isDiag
+                  ? h("div", { className: "hermes-kanban-event-header" },
+                      h("span", { className: "hermes-kanban-event-warning-icon" }, "⚠"),
+                      h("span", { className: "hermes-kanban-event-warning-label" },
+                        getDiagnosticEventLabel(i18n, e.kind) || e.kind),
+                      h("span", { className: "hermes-kanban-event-ago" },
+                        timeAgo ? timeAgo(e.created_at) : ""),
+                    )
+                  : h("div", { className: "hermes-kanban-event-header-plain" },
+                      h("span", { className: "hermes-kanban-event-kind" }, e.kind),
+                      h("span", { className: "hermes-kanban-event-ago" },
+                        timeAgo ? timeAgo(e.created_at) : ""),
+                    ),
+                isDiag && phantoms.length > 0
+                  ? h("div", { className: "hermes-kanban-event-phantom-row" },
+                      h("span", { className: "hermes-kanban-event-phantom-label" },
+                        tx(i18n, "phantomIds", "Phantom ids:")),
+                      phantoms.map(function (pid) {
+                        return h("code", {
+                          key: pid,
+                          className: "hermes-kanban-event-phantom-chip",
+                        }, pid);
+                      }),
+                    )
+                  : null,
+                e.payload && !isDiag
+                  ? h("code", { className: "hermes-kanban-event-payload" },
+                      JSON.stringify(e.payload))
+                  : null,
+              );
+            }))
+          : null,
+      ),
+    );
+
+    return h("div", { className: "hermes-kanban-detail-body" },
+      issuePane,
+      activityPane,
     );
   }
 
@@ -4305,9 +4356,16 @@
     const { t } = useI18n();
     const runs = props.runs || [];
     const [expanded, setExpanded] = useState(false);
-    if (runs.length === 0) return null;
-    const showAll = expanded || runs.length <= 3;
-    const visible = showAll ? runs : runs.slice(-3);
+    if (runs.length === 0) {
+      return h("div", { className: "hermes-kanban-section" },
+        h("div", { className: "hermes-kanban-section-head" }, tx(t, "runHistory", "Run history")),
+        h("div", { className: "hermes-kanban-muted" }, "No runs yet"),
+      );
+    }
+    // Newest attempt first for scannability
+    const ordered = runs.slice().reverse();
+    const showAll = expanded || ordered.length <= 5;
+    const visible = showAll ? ordered : ordered.slice(0, 5);
 
     const fmtElapsed = function (run) {
       if (!run || !run.started_at) return "";
@@ -4328,7 +4386,7 @@
               onClick: function () { setExpanded(true); },
               className: "hermes-kanban-edit-link",
               title: tx(t, "showAllAttempts", "Show all attempts"),
-            }, `+${runs.length - 3} earlier`)
+            }, `Show all ${runs.length}`)
           : null,
       ),
       visible.map(function (r) {
@@ -4372,51 +4430,102 @@
   // Worker log: loads lazily (one GET on mount), refresh button, tail cap.
   function WorkerLogSection(props) {
     const { t } = useI18n();
-    const [state, setState] = useState({ loading: false, data: null, err: null });
-    const load = useCallback(function () {
-      setState({ loading: true, data: null, err: null });
-      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/log?tail=100000`, props.boardSlug))
+    const [state, setState] = useState({ loading: true, data: null, err: null });
+    const [follow, setFollow] = useState(true);
+    const logRef = useRef(null);
+    const live = !!props.live;
+
+    const load = useCallback(function (opts) {
+      const silent = opts && opts.silent;
+      if (!silent) setState(function (prev) {
+        return { loading: !prev.data, data: prev.data, err: null };
+      });
+      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/log?tail=200000`, props.boardSlug))
         .then(function (d) { setState({ loading: false, data: d, err: null }); })
-        .catch(function (e) { setState({ loading: false, data: null, err: String(e.message || e) }); });
+        .catch(function (e) {
+          setState(function (prev) {
+            return { loading: false, data: prev.data, err: String(e.message || e) };
+          });
+        });
     }, [props.taskId, props.boardSlug]);
 
-    // Auto-load when the section mounts; the user opened the drawer so the
-    // cost is one small HTTP round-trip.
     useEffect(function () { load(); }, [load]);
+
+    // Poll while the task is running so the log is easy to follow.
+    useEffect(function () {
+      if (!live) return undefined;
+      const id = setInterval(function () { load({ silent: true }); }, 2500);
+      return function () { clearInterval(id); };
+    }, [live, load]);
+
+    useEffect(function () {
+      if (!follow || !logRef.current) return;
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }, [state.data && state.data.content, follow]);
 
     const data = state.data;
     let body;
-    if (state.loading) {
-      body = h("div", { className: "text-xs text-muted-foreground" },
+    if (state.loading && !data) {
+      body = h("div", { className: "hermes-kanban-log-empty" },
         tx(t, "loadingLog", "Loading log…"));
-    } else if (state.err) {
-      body = h("div", { className: "text-xs text-destructive" }, state.err);
+    } else if (state.err && !data) {
+      body = h("div", { className: "hermes-kanban-log-empty hermes-kanban-msg-err" }, state.err);
     } else if (!data || !data.exists) {
-      body = h("div", { className: "text-xs text-muted-foreground italic" },
-        tx(t, "noWorkerLog",
-          "— no worker log yet (task hasn't spawned or log was rotated away) —"));
+      body = h("div", { className: "hermes-kanban-log-empty" },
+        live
+          ? "Waiting for worker output…"
+          : tx(t, "noWorkerLog",
+              "No worker log yet — task has not spawned, or the log was rotated away."));
     } else {
-      body = h("pre", { className: "hermes-kanban-pre hermes-kanban-log" },
-        data.content || "(empty)");
+      body = h("pre", {
+        ref: logRef,
+        className: "hermes-kanban-pre hermes-kanban-log hermes-kanban-log--panel",
+        onScroll: function (e) {
+          const el = e.currentTarget;
+          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+          if (follow !== atBottom) setFollow(atBottom);
+        },
+      }, data.content || "(empty)");
     }
 
-    return h("div", { className: "hermes-kanban-section" },
-      h("div", { className: "hermes-kanban-section-head-row" },
-        h("span", { className: "hermes-kanban-section-head" },
-          tx(t, "workerLog", "Worker log") + (data && data.size_bytes ? ` (${data.size_bytes} B)` : "")),
-        h("button", {
-          type: "button",
-          onClick: load,
-          className: "hermes-kanban-edit-link",
-          title: "Refresh log",
-        }, "refresh"),
+    return h("div", { className: "hermes-kanban-section hermes-kanban-log-section" },
+      h("div", { className: "hermes-kanban-log-toolbar" },
+        h("div", { className: "hermes-kanban-log-toolbar-left" },
+          h("span", { className: "hermes-kanban-section-head" },
+            tx(t, "workerLog", "Worker log")),
+          live
+            ? h("span", { className: "hermes-kanban-live-dot", title: "Live — auto-refreshing" }, "LIVE")
+            : null,
+          data && data.size_bytes
+            ? h("span", { className: "hermes-kanban-muted" },
+                (data.size_bytes > 1024
+                  ? Math.round(data.size_bytes / 1024) + " KB"
+                  : data.size_bytes + " B"))
+            : null,
+        ),
+        h("div", { className: "hermes-kanban-log-toolbar-right" },
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-log-toolbtn" + (follow ? " is-active" : ""),
+            onClick: function () {
+              setFollow(true);
+              if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+            },
+            title: "Stick to the bottom of the log",
+          }, "Follow"),
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-log-toolbtn",
+            onClick: function () { load(); },
+            title: "Refresh log now",
+          }, state.loading ? "…" : "Refresh"),
+        ),
       ),
       body,
       data && data.truncated
-        ? h("div", { className: "text-xs text-muted-foreground" },
-            tx(t, "logTruncated", "(showing last 100 KB — full log at "),
-            data.path,
-            tx(t, "logAt", ")"))
+        ? h("div", { className: "hermes-kanban-log-foot" },
+            "Showing last ~200 KB",
+            data.path ? (" · " + data.path) : "")
         : null,
     );
   }

@@ -3259,3 +3259,276 @@
   background: color-mix(in srgb, #7170ff 18%, transparent) !important;
   border-color: color-mix(in srgb, #7170ff 40%, transparent) !important;
 }
+
+/* ===================================================================== *
+ * Task detail — two-pane modal (issue pane + dominant worker-log pane)
+ * ---------------------------------------------------------------------
+ * The detail view reuses the right-anchored resizable drawer shell
+ * (.hermes-kanban-drawer / -shade supply its position, width and slide-in)
+ * but replaces the single scrolling body with a two-column layout: a left
+ * "issue" pane (title / props / actions / body / deps / comments) and a
+ * right "activity" pane dominated by a tall, follow-to-bottom worker-log
+ * panel, with run history and events stacked beneath.  These class names
+ * are emitted by TaskDrawer / TaskDetail / WorkerLogSection in index.js;
+ * the board redesign shipped the drawer shell, this styles the interior.
+ * ===================================================================== */
+
+/* -- Header bar (task id + status pill + close) ----------------------- */
+.hermes-kanban-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex: 0 0 auto;
+  padding: 0.75rem 1rem;
+  padding-top: max(0.75rem, env(safe-area-inset-top));
+  border-bottom: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-card, #0f1011) 92%, transparent);
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+/* Mobile: clear the dashboard's fixed top bar (mirrors .hermes-kanban-drawer-head). */
+@media (max-width: 1023px) {
+  .hermes-kanban-detail-head {
+    padding-top: calc(3.5rem + env(safe-area-inset-top));
+  }
+}
+.hermes-kanban-detail-head-left {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+}
+.hermes-kanban-detail-id {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.8rem;
+  letter-spacing: 0.02em;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+.hermes-kanban-detail-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-foreground) 5%, transparent);
+  color: var(--color-foreground);
+  white-space: nowrap;
+}
+
+/* -- Inline error banner / loading + error surfaces ------------------- */
+.hermes-kanban-detail-banner {
+  margin: 0.5rem 0.9rem 0;
+}
+.hermes-kanban-detail-loading {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.85rem;
+}
+
+/* -- Two-pane body ---------------------------------------------------- *
+ * Left issue pane, right activity pane (worker log dominant). Each pane
+ * scrolls independently so a long log never pushes issue metadata out of
+ * reach, and vice-versa. */
+.hermes-kanban-detail-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+  overflow: hidden;
+}
+.hermes-kanban-detail-main,
+.hermes-kanban-detail-activity {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.9rem;
+  padding-bottom: max(0.9rem, calc(0.9rem + env(safe-area-inset-bottom)));
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+.hermes-kanban-detail-main {
+  border-right: 1px solid var(--color-border);
+}
+.hermes-kanban-detail-activity {
+  background: color-mix(in srgb, var(--color-foreground) 2%, transparent);
+}
+/* Collapse to a single scrolling column when the panel approaches
+ * full-width (mobile / narrow viewports). */
+@media (max-width: 900px) {
+  .hermes-kanban-detail-body {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+  .hermes-kanban-detail-main,
+  .hermes-kanban-detail-activity {
+    overflow-y: visible;
+  }
+  .hermes-kanban-detail-main {
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+}
+
+/* -- Issue-pane property block (status / assignee / priority / …) ------ */
+.hermes-kanban-detail-props {
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+  padding: 0.55rem 0.65rem;
+  background: color-mix(in srgb, var(--color-foreground) 4%, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+}
+
+/* -- Worker-log panel (dominant element of the activity pane) --------- */
+.hermes-kanban-log-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.hermes-kanban-log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.hermes-kanban-log-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.hermes-kanban-log-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex: 0 0 auto;
+}
+/* The tall follow-to-bottom log. Also carries .hermes-kanban-pre (frame +
+ * mono) and .hermes-kanban-log (white-space:pre → horizontal scroll);
+ * override the 360px cap so it dominates the activity pane. */
+.hermes-kanban-log--panel {
+  max-height: none;
+  height: min(52vh, 620px);
+  min-height: 240px;
+  overflow: auto;
+}
+.hermes-kanban-live-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #3fb97d;
+  padding: 0.06rem 0.4rem;
+  border: 1px solid color-mix(in srgb, #3fb97d 45%, transparent);
+  border-radius: 999px;
+}
+.hermes-kanban-live-dot::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #3fb97d;
+  box-shadow: 0 0 6px #3fb97d;
+  animation: hermes-kanban-live-pulse 1.6s ease-in-out infinite;
+}
+@keyframes hermes-kanban-live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.hermes-kanban-log-toolbtn {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+  line-height: 1.1;
+  padding: 0.15rem 0.55rem;
+  border-radius: var(--radius-sm, 0.25rem);
+  cursor: pointer;
+}
+.hermes-kanban-log-toolbtn:hover {
+  color: var(--color-foreground);
+  border-color: var(--color-ring);
+}
+.hermes-kanban-log-toolbtn.is-active {
+  color: var(--color-foreground);
+  border-color: var(--color-ring);
+  background: color-mix(in srgb, var(--color-ring) 22%, transparent);
+}
+.hermes-kanban-log-empty {
+  padding: 1rem 0.75rem;
+  text-align: center;
+  color: var(--color-muted-foreground);
+  font-size: 0.8rem;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-foreground) 2%, transparent);
+}
+.hermes-kanban-log-foot {
+  font-size: 0.65rem;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  word-break: break-all;
+}
+
+/* -- Small helpers referenced by the detail panes --------------------- */
+.hermes-kanban-muted {
+  color: var(--color-muted-foreground);
+  font-size: 0.8rem;
+}
+.hermes-kanban-section-toggle-btn {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  color: var(--color-muted-foreground);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+.hermes-kanban-section-toggle-btn:hover { color: var(--color-foreground); }
+/* Event-row timestamp — push to the right edge of the flex header (mirrors
+ * .hermes-kanban-run-ago) so kind/label and time read as two aligned columns. */
+.hermes-kanban-event-ago {
+  margin-left: auto;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+.hermes-kanban-comment-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.hermes-kanban-comment-compose .hermes-kanban-create-btn { align-self: flex-end; }
+.hermes-kanban-comment-input {
+  width: 100%;
+  min-height: 3.25rem;
+  background: var(--color-card);
+  color: var(--color-foreground);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  padding: 0.5rem 0.6rem;
+  font-family: inherit;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  resize: vertical;
+}
+.hermes-kanban-comment-input:focus {
+  outline: none;
+  border-color: var(--color-ring);
+}
