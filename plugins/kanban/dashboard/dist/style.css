@@ -1621,8 +1621,8 @@
   --hk-id-size: 0.68rem;
   --hk-col-gap: 0.65rem;
   --hk-body-gap: 0.45rem;
-  --hk-font: var(--font-sans, Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
-  --hk-mono: var(--font-mono, ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace);
+  --hk-font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --hk-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   font-family: var(--hk-font);
   font-feature-settings: "cv01", "ss03", "tnum";
   color: var(--hk-text);
@@ -2404,4 +2404,424 @@
   grid-column: 1 / -1;
   max-height: 3.5rem !important;
   min-height: 3rem !important;
+}
+
+/* ===== HERMES KANBAN — TYPE + BEAUTY v3 ================================
+ * Kill theme display fonts (Mondwest / Expanded / tracking circus).
+ * Inter + system UI stack, quiet product chrome.
+ * ====================================================================== */
+
+.hermes-kanban,
+.hermes-kanban *:not(code):not(pre):not(.hermes-kanban-card-id):not(.hermes-kanban-event-payload):not(kbd),
+.hermes-kanban *::before,
+.hermes-kanban *::after {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, system-ui, sans-serif !important;
+  font-feature-settings: "cv01" 1, "ss03" 1, "tnum" 1 !important;
+  font-synthesis: none;
+}
+
+.hermes-kanban code,
+.hermes-kanban pre,
+.hermes-kanban kbd,
+.hermes-kanban .hermes-kanban-card-id,
+.hermes-kanban .hermes-kanban-event-payload,
+.hermes-kanban .hermes-kanban-drawer-head,
+.hermes-kanban .font-mono,
+.hermes-kanban [class*="font-mono"] {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco,
+    Consolas, "Liberation Mono", monospace !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+}
+
+.hermes-kanban,
+.hermes-kanban * {
+  letter-spacing: normal !important;
+  text-transform: none !important;
+  font-variant: normal !important;
+}
+.hermes-kanban {
+  font-size: 13px !important;
+  font-weight: 400 !important;
+  line-height: 1.45 !important;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--hk-text, var(--color-foreground, #e8eaed)) !important;
+}
+
+.hermes-kanban button,
+.hermes-kanban input,
+.hermes-kanban select,
+.hermes-kanban textarea,
+.hermes-kanban [role="button"],
+.hermes-kanban [role="combobox"],
+.hermes-kanban [role="checkbox"],
+.hermes-kanban label {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif !important;
+  font-weight: 500 !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+  font-size: 13px !important;
+  line-height: 1.3 !important;
+}
+
+.hermes-kanban button,
+.hermes-kanban [class*="Button"] {
+  border-radius: 7px !important;
+  font-weight: 500 !important;
+}
+
+.hermes-kanban-toolbar {
+  padding: 0.6rem 0.75rem !important;
+  gap: 0.55rem 0.7rem !important;
+  background: color-mix(in srgb, var(--color-card, #141516) 70%, transparent) !important;
+  border: 1px solid color-mix(in srgb, #fff 6%, transparent) !important;
+  border-radius: 10px !important;
+  box-shadow: 0 1px 0 color-mix(in srgb, #fff 3%, transparent) inset;
+}
+.hermes-kanban-toolbar .hermes-kanban-toolbar-field > label,
+.hermes-kanban-toolbar .text-xs.text-muted-foreground,
+.hermes-kanban-toolbar label {
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.01em !important;
+  text-transform: none !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 45%, transparent) !important;
+  opacity: 1 !important;
+}
+.hermes-kanban-toolbar input,
+.hermes-kanban-toolbar select,
+.hermes-kanban-toolbar [role="combobox"] {
+  font-size: 13px !important;
+  font-weight: 400 !important;
+  height: 32px !important;
+  border-radius: 7px !important;
+  border: 1px solid color-mix(in srgb, #fff 8%, transparent) !important;
+  background: color-mix(in srgb, #000 25%, transparent) !important;
+}
+.hermes-kanban-toolbar-search-kbd {
+  font-family: "JetBrains Mono", ui-monospace, monospace !important;
+  font-size: 10px !important;
+  font-weight: 500 !important;
+  opacity: 0.55;
+}
+.hermes-kanban-density button {
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  padding: 0.35rem 0.6rem !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+}
+.hermes-kanban-kbd-btn {
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  min-width: 28px;
+}
+
+.hermes-kanban-history-rail {
+  padding: 0.55rem 0.85rem !important;
+  border-radius: 10px !important;
+  border: 1px solid color-mix(in srgb, #fff 6%, transparent) !important;
+  background: color-mix(in srgb, var(--color-card, #141516) 55%, transparent) !important;
+}
+.hermes-kanban-history-rail-label {
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.01em !important;
+  color: var(--color-foreground, #f0f1f2) !important;
+}
+.hermes-kanban-history-rail-meta {
+  font-size: 12px !important;
+  font-weight: 400 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 45%, transparent) !important;
+}
+.hermes-kanban-history-rail-btn {
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  padding: 0.35rem 0.7rem !important;
+  border-radius: 7px !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+}
+
+.hermes-kanban-columns {
+  gap: 0.65rem !important;
+}
+.hermes-kanban-column {
+  border-radius: 12px !important;
+  border: 1px solid color-mix(in srgb, #fff 6%, transparent) !important;
+  background: color-mix(in srgb, var(--color-card, #121314) 80%, transparent) !important;
+  padding: 0.5rem !important;
+  box-shadow: none !important;
+}
+.hermes-kanban-column-header {
+  padding: 0.4rem 0.35rem 0.5rem !important;
+  margin-bottom: 0.1rem;
+}
+.hermes-kanban-column-label {
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.015em !important;
+  text-transform: none !important;
+  color: var(--color-foreground, #f2f3f4) !important;
+}
+.hermes-kanban-column-count {
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  font-variant-numeric: tabular-nums !important;
+  min-width: 1.4rem;
+  padding: 0.1rem 0.4rem !important;
+  border-radius: 999px !important;
+  background: color-mix(in srgb, #fff 6%, transparent) !important;
+  border: 1px solid color-mix(in srgb, #fff 5%, transparent) !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 55%, transparent) !important;
+}
+.hermes-kanban-column-add {
+  font-size: 16px !important;
+  font-weight: 400 !important;
+  width: 1.5rem !important;
+  height: 1.5rem !important;
+  border-radius: 6px !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 50%, transparent) !important;
+}
+.hermes-kanban-column-add:hover {
+  color: var(--color-foreground, #fff) !important;
+  background: color-mix(in srgb, #fff 6%, transparent) !important;
+}
+
+.hermes-kanban-dot {
+  width: 7px !important;
+  height: 7px !important;
+  box-shadow: none !important;
+  opacity: 0.9;
+}
+
+.hermes-kanban-card > *,
+.hermes-kanban-card > div,
+.hermes-kanban-card .rounded-lg {
+  border-radius: 9px !important;
+  border: 1px solid color-mix(in srgb, #fff 7%, transparent) !important;
+  background: color-mix(in srgb, #0a0b0c 40%, var(--color-card, #161718)) !important;
+  box-shadow: none !important;
+  transition: border-color 120ms ease, background 120ms ease !important;
+}
+.hermes-kanban-card:hover > *,
+.hermes-kanban-card:hover > div {
+  border-color: color-mix(in srgb, #fff 14%, transparent) !important;
+  background: color-mix(in srgb, #fff 3%, var(--color-card, #18191a)) !important;
+}
+.hermes-kanban-card-content {
+  padding: 0.6rem 0.7rem !important;
+  gap: 0.35rem !important;
+  background: transparent !important;
+  border: 0 !important;
+}
+.hermes-kanban-card-title {
+  font-size: 13.5px !important;
+  font-weight: 500 !important;
+  line-height: 1.35 !important;
+  letter-spacing: -0.011em !important;
+  color: var(--color-foreground, #f4f5f6) !important;
+}
+.hermes-kanban-card-id {
+  font-size: 11px !important;
+  font-weight: 400 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 38%, transparent) !important;
+  opacity: 1 !important;
+}
+.hermes-kanban-card-meta,
+.hermes-kanban-assignee,
+.hermes-kanban-unassigned,
+.hermes-kanban-ago,
+.hermes-kanban-count {
+  font-size: 11.5px !important;
+  font-weight: 400 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 48%, transparent) !important;
+}
+.hermes-kanban-assignee {
+  font-weight: 500 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 72%, #7170ff) !important;
+}
+.hermes-kanban-priority,
+.hermes-kanban-tag,
+.hermes-kanban-needs-assignee {
+  font-size: 10.5px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+  border-radius: 999px !important;
+  padding: 0.12rem 0.45rem !important;
+}
+
+.hermes-kanban-card--focused > *,
+.hermes-kanban-card--focused > div {
+  border-color: color-mix(in srgb, #7170ff 70%, #fff) !important;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, #7170ff 50%, transparent),
+    0 0 0 4px color-mix(in srgb, #7170ff 18%, transparent) !important;
+}
+.hermes-kanban-card--selected > *,
+.hermes-kanban-card--selected > div {
+  border-color: color-mix(in srgb, #7170ff 45%, transparent) !important;
+  background: color-mix(in srgb, #7170ff 10%, var(--color-card, #161718)) !important;
+}
+
+.hermes-kanban-empty {
+  min-height: 6.5rem !important;
+  padding: 1.35rem 0.85rem !important;
+  border: 1px dashed color-mix(in srgb, #fff 8%, transparent) !important;
+  border-radius: 10px !important;
+  background: color-mix(in srgb, #fff 1.5%, transparent) !important;
+  gap: 0.3rem !important;
+}
+.hermes-kanban-empty-icon {
+  width: 1.75rem !important;
+  height: 1.75rem !important;
+  font-size: 0.8rem !important;
+  border-radius: 7px !important;
+  border: 1px solid color-mix(in srgb, #fff 7%, transparent) !important;
+  background: color-mix(in srgb, #fff 3%, transparent) !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 45%, transparent) !important;
+  margin-bottom: 0.25rem !important;
+}
+.hermes-kanban-empty-title {
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  letter-spacing: -0.01em !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 70%, transparent) !important;
+}
+.hermes-kanban-empty-hint {
+  font-size: 12px !important;
+  font-weight: 400 !important;
+  line-height: 1.4 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 40%, transparent) !important;
+  max-width: 15rem;
+}
+
+.hermes-kanban-board-empty {
+  border-radius: 12px !important;
+  border: 1px solid color-mix(in srgb, #fff 7%, transparent) !important;
+  background: color-mix(in srgb, var(--color-card, #141516) 70%, transparent) !important;
+  padding: 1.5rem 1.25rem !important;
+}
+.hermes-kanban-board-empty-title {
+  font-size: 15px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.02em !important;
+  color: var(--color-foreground, #f2f3f4) !important;
+}
+.hermes-kanban-board-empty-hint {
+  font-size: 13px !important;
+  font-weight: 400 !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 48%, transparent) !important;
+  max-width: 26rem;
+}
+
+.hermes-kanban-drawer {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif !important;
+  border-left: 1px solid color-mix(in srgb, #fff 8%, transparent) !important;
+  box-shadow: -16px 0 48px rgba(0,0,0,0.45) !important;
+}
+.hermes-kanban-drawer,
+.hermes-kanban-drawer * {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+.hermes-kanban-drawer code,
+.hermes-kanban-drawer pre,
+.hermes-kanban-drawer .hermes-kanban-event-payload {
+  font-family: "JetBrains Mono", ui-monospace, Menlo, monospace !important;
+}
+.hermes-kanban-drawer-title,
+.hermes-kanban-drawer-title-text {
+  font-size: 17px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.02em !important;
+  line-height: 1.3 !important;
+}
+.hermes-kanban-section-head {
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.02em !important;
+  text-transform: none !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 45%, transparent) !important;
+}
+
+.hermes-kanban-help {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+  border-radius: 14px !important;
+  border: 1px solid color-mix(in srgb, #fff 8%, transparent) !important;
+}
+.hermes-kanban-help-title {
+  font-size: 15px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.02em !important;
+}
+.hermes-kanban-help-row {
+  font-size: 13px !important;
+  font-weight: 400 !important;
+}
+.hermes-kanban-help-row kbd {
+  font-family: "JetBrains Mono", ui-monospace, monospace !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+}
+
+.hermes-kanban-boardswitcher,
+.hermes-kanban-boardswitcher *,
+.hermes-kanban-dialog,
+.hermes-kanban-dialog * {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+.hermes-kanban-dialog-title {
+  font-size: 15px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.02em !important;
+}
+
+.hermes-kanban-lane-head {
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.01em !important;
+  text-transform: none !important;
+  color: color-mix(in srgb, var(--color-foreground, #fff) 42%, transparent) !important;
+}
+
+.hermes-kanban-bulk,
+.hermes-kanban-bulk * {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+.hermes-kanban-bulk-count {
+  font-size: 12px !important;
+  font-weight: 500 !important;
+}
+
+.hermes-kanban-show-more {
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+}
+
+.hermes-kanban-inline-create textarea,
+.hermes-kanban-inline-create input {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+  font-size: 13px !important;
+  font-weight: 400 !important;
+  letter-spacing: normal !important;
+}
+
+.hermes-kanban-attention-bar,
+.hermes-kanban-attention-bar *,
+.hermes-kanban-diag-title,
+.hermes-kanban-diag-detail {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
 }

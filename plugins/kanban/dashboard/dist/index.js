@@ -12,6 +12,17 @@
 (function () {
   "use strict";
 
+  // Load clean UI fonts for the board (MONO theme display faces are unreadable
+  // on a dense ops surface). Idempotent.
+  (function ensureKanbanFonts() {
+    if (document.getElementById("hermes-kanban-font")) return;
+    var link = document.createElement("link");
+    link.id = "hermes-kanban-font";
+    link.rel = "stylesheet";
+    link.href = "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
+    document.head.appendChild(link);
+  })();
+
   const SDK = window.__HERMES_PLUGIN_SDK__;
   if (!SDK) return;
 
