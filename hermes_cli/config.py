@@ -1595,6 +1595,25 @@ DEFAULT_CONFIG = {
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
         },
+        # UI-specialized vision task, distinct from `vision` above. Backs the
+        # `inspect_ui` tool: routes UI screenshots to a GUI-grounding model
+        # (Holo) that returns element locations/coordinates + layout/state,
+        # rather than general image description. Treated as a first-class
+        # vision task by the router (see auxiliary_client._is_vision_task), so
+        # it gets the same vision-client handling as `vision`. Default endpoint
+        # is the home cluster's Holo-4B on gpu1 (no-think :8081 — grounding
+        # wants deterministic coordinates, not chain-of-thought); flip base_url
+        # to :8080 for the thinking variant or to the dgx2 35B for harder UI
+        # reasoning.
+        "inspect_ui": {
+            "provider": "custom",
+            "model": "holo-4b",
+            "base_url": "http://192.168.1.45:8081/v1",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {},
+            "download_timeout": 30,
+        },
         "web_extract": {
             "provider": "auto",
             "model": "",
