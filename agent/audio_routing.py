@@ -47,8 +47,15 @@ _DEFAULT_AUDIO_CAPTION = "Respond to the user's spoken message in the attached a
 # self._voice_mode is active, so native-audio turns get the same concise
 # conversational style.
 _VOICE_MODE_GUIDANCE = (
-    "[Voice input — respond concisely and conversationally, "
-    "2-3 sentences max. No code blocks or markdown.]"
+    "[Voice input — do the task exactly as you normally would: use tools, "
+    "run commands, edit files, and reason through as many steps as it takes. "
+    "This only shapes your final spoken reply, which will be read aloud by "
+    "text-to-speech — so write that reply for the ear, not the screen: plain "
+    "spoken language, no markdown, code blocks, bullet lists, tables, URLs, or "
+    "symbols to be read out. If you did work, say what you did and how it turned "
+    "out rather than pasting it. Let the length fit the content — a word or two "
+    "when that's the answer, a few sentences when more is genuinely needed — but "
+    "stay tight and skip filler.]"
 )
 
 
