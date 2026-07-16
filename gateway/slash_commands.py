@@ -329,6 +329,63 @@ class GatewaySlashCommandsMixin:
             return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")
         return EphemeralReply(f"{header}{_tip_line}")
 
+    async def _handle_cd_command(self, event: MessageEvent, session_key: str) -> str:
+        """Handle /cd [path] — show or set THIS session's working directory.
+
+        The gateway is one process serving every topic and DM, and its own cwd
+        is wherever launchd started it. So "where am I" cannot be the process
+        cwd — it has to be per session, which is exactly what Hermes already
+        tracks: ``record_session_cwd`` is written after every terminal command,
+        and terminal/file/code tools all resolve through ``get_session_cwd``.
+
+        This writes the same record, so `/cd` and the agent's own `cd` are the
+        same state rather than two competing notions of where a topic is. In a
+        terminal you would just `cd` before launching; in a topic there is no
+        "before", which is why this exists.
+        """
+        import os
+
+        from tools.terminal_tool import get_session_cwd, record_session_cwd
+
+        raw = (event.get_command_args() or "").strip()
+        current = get_session_cwd(session_key)
+
+        if not raw:
+            return (
+                f"📂 `{current}`" if current else
+                "📂 This session has no working directory set yet — tools resolve "
+                "against the gateway's own cwd.\n\nSet one with `/cd <path>`."
+            )
+
+        path = os.path.abspath(os.path.expanduser(os.path.expandvars(raw)))
+        if not os.path.exists(path):
+            return f"❌ No such path: `{path}`"
+        if not os.path.isdir(path):
+            return f"❌ Not a directory: `{path}`"
+
+        record_session_cwd(session_key, path)
+        lines = [f"✅ `{current or '(unset)'}` → `{path}`"]
+
+        # If it's a repo, say so — that is what the orchestrator resolves.
+        try:
+            import subprocess
+
+            p = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True, timeout=10)
+            if p.returncode == 0 and p.stdout.strip():
+                top = p.stdout.strip().splitlines()[0]
+                b = subprocess.run(["git", "-C", path, "branch", "--show-current"],
+                                   capture_output=True, text=True, timeout=10)
+                lines.append(f"\n📦 git repo `{top}` on `{(b.stdout or '').strip() or 'detached'}`")
+        except Exception:
+            pass
+
+        lines.append(
+            "\nThis session only — other topics and DMs keep their own. "
+            "**Not persisted across a gateway restart** yet."
+        )
+        return "\n".join(lines)
+
     async def _handle_profile_command(self, event: MessageEvent) -> str:
         """Handle /profile [name] — show, or BIND, the profile serving this chat.
 

@@ -10068,6 +10068,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
+        if canonical == "cd":
+            return await self._handle_cd_command(event, _quick_key)
+
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
 
