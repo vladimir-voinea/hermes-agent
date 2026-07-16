@@ -167,6 +167,37 @@ def test_run_slash_json_output(kanban_home):
     assert payload["status"] == "ready"
 
 
+def test_run_slash_create_runtime_default_is_hermes(kanban_home):
+    out = kc.run_slash("create 'card' --assignee alice --json")
+    payload = json.loads(out)
+    assert payload["worker_runtime"] == "hermes"
+
+
+def test_run_slash_create_runtime_opencode(kanban_home, monkeypatch):
+    from hermes_cli import kanban_worker_runtimes as runtimes
+    real = runtimes.is_runtime_enabled
+    monkeypatch.setattr(
+        runtimes, "is_runtime_enabled",
+        lambda name: True if runtimes.normalize_runtime(name) == "opencode" else real(name),
+    )
+    out = kc.run_slash("create 'oc card' --runtime opencode --json")
+    payload = json.loads(out)
+    assert payload["worker_runtime"] == "opencode"
+    assert payload["assignee"] is None
+    # show surfaces the runtime line; list shows a non-default badge.
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", payload["id"]).group(1)
+    show = kc.run_slash(f"show {tid}")
+    assert "runtime:   opencode" in show
+    listing = kc.run_slash("list")
+    assert "oc card" in listing and "⚙opencode" in listing
+
+
+def test_run_slash_create_runtime_unknown_rejected(kanban_home):
+    out = kc.run_slash("create 'bad' --runtime codex")
+    assert "unknown worker runtime" in out
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")

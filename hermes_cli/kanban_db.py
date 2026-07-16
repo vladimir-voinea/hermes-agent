@@ -950,6 +950,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Worker runtime that owns this card's attempts. ``"hermes"`` (the
+    # default) spawns a Hermes profile worker; an external runtime id
+    # (e.g. ``"opencode"``) spawns a lifecycle bridge. Null/missing on
+    # legacy rows is equivalent to ``"hermes"`` — see the column comment
+    # in SCHEMA_SQL and ``kanban_worker_runtimes``.
+    worker_runtime: str = "hermes"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1033,6 +1039,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            worker_runtime=(
+                row["worker_runtime"]
+                if "worker_runtime" in keys and row["worker_runtime"]
+                else "hermes"
             ),
         )
 
@@ -1211,7 +1222,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Worker runtime that owns this card's attempts. 'hermes' (the
+    -- default) spawns a Hermes profile worker; an external runtime id
+    -- (e.g. 'opencode') spawns a lifecycle bridge that runs the external
+    -- agent and writes board state back via this kernel. NULL/missing on
+    -- legacy rows is equivalent to 'hermes' — no migration surprise for
+    -- existing boards. Validated at write time against the runtime
+    -- registry (see hermes_cli.kanban_worker_runtimes).
+    worker_runtime       TEXT NOT NULL DEFAULT 'hermes'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2044,6 +2063,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "worker_runtime" not in cols:
+        # Pluggable worker runtime. Existing rows default to 'hermes',
+        # preserving the behaviour they had before the column existed
+        # (every card spawned a Hermes profile worker). NOT NULL DEFAULT
+        # 'hermes' on the fresh-schema path; the additive ALTER below uses
+        # the same default for legacy rows.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "worker_runtime",
+            "worker_runtime TEXT NOT NULL DEFAULT 'hermes'",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2465,6 +2497,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    worker_runtime: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2505,6 +2538,29 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    # Validate + normalise the worker runtime. Unknown ids and known-but-
+    # disabled runtimes are rejected at write time so a card never sits in
+    # ``ready`` waiting for a runtime that can never spawn on this host.
+    # ``None``/empty falls through to ``hermes`` (zero migration).
+    from hermes_cli import kanban_worker_runtimes as _runtimes
+    runtime_id = _runtimes.validate_runtime(worker_runtime)
+    runtime_info = _runtimes.get_runtime(runtime_id)
+    # Hermes-only feature flags have no meaning on an external runtime.
+    # Reject (fail closed) with a clear message naming the offending flag
+    # so the caller stops pretending the runtime has capabilities it lacks.
+    if runtime_info is not None and runtime_info.unsupported_flags:
+        if goal_mode and "goal_mode" in runtime_info.unsupported_flags:
+            raise ValueError(
+                f"goal_mode is a Hermes-only feature and is not supported "
+                f"by the {runtime_id!r} worker runtime"
+            )
+    # External runtimes may omit the assignee (displayed as the runtime id);
+    # Hermes-native runtimes keep requiring a real profile assignee, gated
+    # by profile_exists in the dispatcher as before. We do NOT add a
+    # create-time profile_exists check for hermes — that would be a new
+    # restriction on existing fleet behaviour and the dispatcher already
+    # buckets non-profile assignees as nonspawnable.
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2593,6 +2649,20 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+
+    # Hermes-only ``skills`` force-load has no meaning on an external
+    # runtime (the bridge runs the external agent, which has no Hermes
+    # skill loader). Reject with a clear message rather than silently
+    # dropping the request — same fail-closed policy as goal_mode above.
+    if (
+        skills_list
+        and runtime_info is not None
+        and "skills" in runtime_info.unsupported_flags
+    ):
+        raise ValueError(
+            f"--skills is a Hermes-only feature and is not supported "
+            f"by the {runtime_id!r} worker runtime"
+        )
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -2693,8 +2763,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        worker_runtime
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2717,6 +2788,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        runtime_id,
                     ),
                 )
                 for pid in parents:
@@ -2736,6 +2808,7 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "worker_runtime": runtime_id,
                     },
                 )
             return task_id
@@ -2862,6 +2935,44 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
         return True
+
+
+def set_worker_runtime(
+    conn: sqlite3.Connection, task_id: str, runtime: Optional[str]
+) -> str:
+    """Change a task's worker runtime (dashboard/CLI edit path).
+
+    Validates ``runtime`` through the same registry path as
+    :func:`create_task` (unknown / disabled runtimes rejected with a clear
+    error) and refuses to change a task that is currently running — the
+    in-flight attempt was spawned under the old runtime and must finish
+    first. Returns the normalised runtime id that was written.
+    """
+    from hermes_cli import kanban_worker_runtimes as _runtimes
+    runtime_id = _runtimes.validate_runtime(runtime)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_runtime FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"unknown task: {task_id}")
+        if row["claim_lock"] is not None and row["status"] == "running":
+            raise RuntimeError(
+                f"cannot change runtime of {task_id}: currently running "
+                "(claimed). Wait for completion or reclaim the stale lock first."
+            )
+        prev = row["worker_runtime"] if row["worker_runtime"] else "hermes"
+        if prev != runtime_id:
+            conn.execute(
+                "UPDATE tasks SET worker_runtime = ? WHERE id = ?",
+                (runtime_id, task_id),
+            )
+            _append_event(
+                conn, task_id, "runtime_changed",
+                {"from": prev, "to": runtime_id},
+            )
+        return runtime_id
 
 
 # ---------------------------------------------------------------------------
@@ -7471,7 +7582,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, worker_runtime FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7530,18 +7641,29 @@ def _dispatch_once_locked(
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
+        # External runtimes (e.g. opencode) do not run a Hermes profile:
+        # they skip the profile_exists gate and may omit the assignee
+        # entirely (displayed as the runtime id). Hermes-native runtimes
+        # keep requiring a real profile assignee.
+        row_external = _is_external_runtime(row["worker_runtime"])
         if not row_assignee:
-            # Honour kanban.default_assignee: when the dispatcher hits an
-            # unassigned ready task and an operator-configured fallback
-            # exists, persist the assignment and proceed. This removes the
-            # dashboard footgun where a task created without an assignee
-            # parks in 'ready' forever even though the operator's intent
-            # ("default") was perfectly clear (#27145). Mutating the row
-            # (not just the in-memory view) keeps diagnostics and the
-            # board state consistent: the task is now legitimately owned
-            # by ``kanban.default_assignee``, not "unassigned but secretly
-            # routed".
-            if _default_assignee and _default_assignee_resolved:
+            if row_external:
+                # External runtime with no assignee: use the runtime id as
+                # the per-profile tracking key so the concurrency cap and
+                # spawn result still have a non-empty owner. The task is
+                # NOT skipped — external workers don't need a profile.
+                row_assignee = row["worker_runtime"]
+            elif _default_assignee and _default_assignee_resolved:
+                # Honour kanban.default_assignee: when the dispatcher hits an
+                # unassigned ready task and an operator-configured fallback
+                # exists, persist the assignment and proceed. This removes the
+                # dashboard footgun where a task created without an assignee
+                # parks in 'ready' forever even though the operator's intent
+                # ("default") was perfectly clear (#27145). Mutating the row
+                # (not just the in-memory view) keeps diagnostics and the
+                # board state consistent: the task is now legitimately owned
+                # by ``kanban.default_assignee``, not "unassigned but secretly
+                # routed".
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
                 # 'assigned' event so the board state matches what just happened.
@@ -7583,19 +7705,24 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
-            continue
+        #
+        # External runtimes are exempt: they spawn a lifecycle bridge,
+        # not ``hermes -p <profile>``, so the profile_exists gate does
+        # not apply.
+        if not row_external:
+            try:
+                from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+            except Exception:
+                profile_exists = None  # type: ignore[assignment]
+            if profile_exists is not None and not profile_exists(row_assignee):
+                # Bucket separately from skipped_unassigned: the operator
+                # cannot fix this by assigning a profile (the assignee IS the
+                # intended owner — a terminal lane). Health telemetry uses
+                # this distinction to suppress spurious "stuck" warnings on
+                # multi-lane setups where the ready queue is steadily full
+                # of human-pulled work.
+                result.skipped_nonspawnable.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -7663,8 +7790,18 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        # Resolve the spawn function: an explicit ``spawn_fn`` override
+        # wins (back-compat with test stubs); otherwise the spawn-time
+        # registry selects the adapter for this task's worker_runtime
+        # (default ``hermes`` → ``_default_spawn``). The resolution is
+        # inside the try/except below so an unregistered runtime (e.g.
+        # opencode before its bridge adapter ships) records a counted
+        # spawn failure rather than crashing the tick.
         try:
+            if spawn_fn is not None:
+                _spawn = spawn_fn
+            else:
+                _spawn = resolve_spawn_adapter(claimed.worker_runtime).spawn
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
@@ -7761,8 +7898,11 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
+            if spawn_fn is not None:
+                _spawn = spawn_fn
+            else:
+                _spawn = resolve_spawn_adapter(claimed.worker_runtime).spawn
             import inspect
             try:
                 sig = inspect.signature(_spawn)
@@ -8228,6 +8368,82 @@ def _default_spawn(
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
     return proc.pid
+
+
+# ---------------------------------------------------------------------------
+# Spawn-time worker runtime registry
+# ---------------------------------------------------------------------------
+#
+# The *write-time* registry (known runtimes, enabled check, assignee rules)
+# lives in ``kanban_worker_runtimes``. This is its spawn-time counterpart:
+# it maps a runtime name to the spawn adapter the dispatcher invokes.
+#
+# An adapter is a thin struct holding the runtime name, whether it is
+# *external* (skips the Hermes ``profile_exists`` gate and may omit an
+# assignee), and the ``spawn(task, workspace, *, board=None) -> pid``
+# callable. The Hermes adapter wraps :func:`_default_spawn`; a later
+# OpenCode adapter (ticket 03) will wrap the lifecycle bridge. Adding a
+# runtime is a single :func:`register_spawn_adapter` call — no dispatcher
+# change, no schema change.
+
+@dataclass(frozen=True)
+class SpawnAdapter:
+    """Spawn-time adapter for one worker runtime.
+
+    ``spawn`` has the same signature as :func:`_default_spawn`:
+    ``spawn(task, workspace, *, board=None) -> Optional[int]``.
+    """
+
+    name: str
+    external: bool
+    spawn: Any  # Callable[[Task, str], Optional[int]] with optional board kw
+
+
+_SPAWN_ADAPTERS: dict[str, SpawnAdapter] = {}
+
+
+def register_spawn_adapter(adapter: SpawnAdapter) -> None:
+    """Register (or replace) the spawn adapter for a runtime name."""
+    _SPAWN_ADAPTERS[adapter.name] = adapter
+
+
+def unregister_spawn_adapter(name: str) -> None:
+    """Remove a spawn adapter (test helper / teardown)."""
+    _SPAWN_ADAPTERS.pop(name, None)
+
+
+def resolve_spawn_adapter(runtime: Optional[str]) -> SpawnAdapter:
+    """Return the spawn adapter for ``runtime`` (default ``hermes``).
+
+    Raises ``ValueError`` for unknown runtimes so the dispatcher's spawn
+    failure path records a counted failure (circuit breaker) rather than
+    silently no-op'ing a card that can never spawn.
+    """
+    from hermes_cli.kanban_worker_runtimes import normalize_runtime
+
+    normalised = normalize_runtime(runtime)
+    adapter = _SPAWN_ADAPTERS.get(normalised)
+    if adapter is None:
+        raise ValueError(
+            f"unknown worker runtime {normalised!r}; no spawn adapter "
+            f"registered (registered: {', '.join(sorted(_SPAWN_ADAPTERS)) or 'none'})"
+        )
+    return adapter
+
+
+def _is_external_runtime(runtime: Optional[str]) -> bool:
+    """True iff ``runtime`` is a registered external (non-Hermes) runtime."""
+    from hermes_cli.kanban_worker_runtimes import is_external_runtime
+
+    return is_external_runtime(runtime)
+
+
+# Register the Hermes adapter — the historic spawn path. Done at import
+# time so the dispatcher always has a default. ``_default_spawn`` is
+# defined above, so the reference is stable.
+register_spawn_adapter(
+    SpawnAdapter(name="hermes", external=False, spawn=_default_spawn)
+)
 
 
 # ---------------------------------------------------------------------------

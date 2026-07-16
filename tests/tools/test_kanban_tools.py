@@ -1136,6 +1136,55 @@ def test_create_rejects_no_assignee(worker_env):
     assert json.loads(kt._handle_create({"title": "t"})).get("error")
 
 
+def test_create_unknown_runtime_rejected(worker_env):
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_create({
+        "title": "t", "assignee": "a", "worker_runtime": "codex",
+    }))
+    assert out.get("error")
+    assert "unknown worker runtime" in out["error"]
+
+
+def test_create_hermes_runtime_requires_assignee(worker_env):
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_create({
+        "title": "t", "worker_runtime": "hermes",
+    }))
+    assert out.get("error")
+    assert "assignee is required" in out["error"]
+
+
+def test_create_opencode_runtime_omits_assignee(worker_env, monkeypatch):
+    """External runtimes may omit the assignee (no profile_exists gate)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_worker_runtimes as runtimes
+    real = runtimes.is_runtime_enabled
+    monkeypatch.setattr(
+        runtimes, "is_runtime_enabled",
+        lambda name: True if runtimes.normalize_runtime(name) == "opencode" else real(name),
+    )
+    out = json.loads(kt._handle_create({
+        "title": "oc card", "worker_runtime": "opencode",
+    }))
+    assert out.get("ok") is True, out
+    assert out["worker_runtime"] == "opencode"
+
+
+def test_create_opencode_rejects_hermes_only_flags(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_worker_runtimes as runtimes
+    real = runtimes.is_runtime_enabled
+    monkeypatch.setattr(
+        runtimes, "is_runtime_enabled",
+        lambda name: True if runtimes.normalize_runtime(name) == "opencode" else real(name),
+    )
+    out = json.loads(kt._handle_create({
+        "title": "oc", "worker_runtime": "opencode", "goal_mode": True,
+    }))
+    assert out.get("error")
+    assert "Hermes-only" in out["error"]
+
+
 def test_create_rejects_non_list_parents(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({"title": "t", "assignee": "a", "parents": 42})

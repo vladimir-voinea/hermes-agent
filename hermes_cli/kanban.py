@@ -54,7 +54,11 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    # Surface non-default runtimes so OpenCode (and future external
+    # worker) cards are visually distinct from Hermes profile workers
+    # at a glance on the board.
+    runtime = f" ⚙{t.worker_runtime}" if t.worker_runtime and t.worker_runtime != "hermes" else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}{runtime}  {t.title}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -80,6 +84,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "worker_runtime": t.worker_runtime,
     }
 
 
@@ -360,6 +365,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--runtime", default=None,
+                          metavar="RUNTIME",
+                          help="Worker runtime that owns this card's attempts. "
+                               "Defaults to 'hermes' (a Hermes profile worker). "
+                               "An external runtime id (e.g. 'opencode') spawns a "
+                               "lifecycle bridge that runs the external agent "
+                               "headlessly. Unknown or disabled runtimes are "
+                               "rejected with a clear error.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1347,6 +1360,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            worker_runtime=getattr(args, "runtime", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1509,6 +1523,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
+    print(f"  runtime:   {task.worker_runtime or 'hermes'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
