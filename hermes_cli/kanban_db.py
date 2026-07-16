@@ -9002,6 +9002,26 @@ def _opencode_spawn(
     env["HERMES_ACCEPT_HOOKS"] = "1"
     env.pop("HERMES_TUI", None)
 
+    # ★ Resolve the runtime here, in the process that already decided this
+    #   runtime is spawnable, and hand the answer down. The bridge runs with
+    #   HERMES_HOME pointing at the ASSIGNEE'S PROFILE, and Hermes profiles do
+    #   not inherit config — they merge onto DEFAULT_CONFIG, never onto the
+    #   root's. So a bridge left to re-read `kanban.runtimes.opencode` itself
+    #   reads a different file than the dispatcher did and can disagree with
+    #   it: the card validates and spawns, then dies with "binary not found"
+    #   because the profile's config never had the path. Where the binary lives
+    #   is a fact about the host, not about the profile.
+    from hermes_cli.kanban_worker_runtimes import _resolve_command, _runtime_config
+
+    resolved = _resolve_command("opencode")
+    if resolved:
+        env["HERMES_OPENCODE_COMMAND"] = resolved
+    _cfg = _runtime_config("opencode")
+    if _cfg.get("default_model"):
+        env["HERMES_OPENCODE_MODEL"] = str(_cfg["default_model"])
+    if _cfg.get("extra_args"):
+        env["HERMES_OPENCODE_EXTRA_ARGS"] = json.dumps(_cfg["extra_args"])
+
     cmd = [sys.executable, "-m", "hermes_cli.kanban_opencode_bridge"]
 
     log_dir = worker_logs_dir(board=board)

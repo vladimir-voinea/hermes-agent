@@ -15,6 +15,7 @@ card is closed", so the cases here are about that boundary:
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -51,20 +52,33 @@ def card(kanban_home, monkeypatch):
 
 
 def _fake_opencode(monkeypatch, *results):
-    """Queue up (returncode, stdout) results for successive opencode runs."""
+    """Queue up (returncode, stdout) results for successive opencode runs.
+
+    Fakes Popen rather than run(): the bridge streams OpenCode's output line by
+    line (a card takes minutes, and a log that only appears at the end cannot
+    tell "working" from "hung"), so a run()-shaped double would be testing a
+    call the bridge no longer makes.
+    """
     calls = []
     queue = list(results)
 
-    class _R:
+    class _FakeProc:
         def __init__(self, rc, out):
-            self.returncode, self.stdout, self.stderr = rc, out, ""
+            self._rc = rc
+            self.stdout = iter(out.splitlines(keepends=True))
 
-    def _run(argv, **kwargs):
+        def wait(self, timeout=None):
+            return self._rc
+
+        def kill(self):
+            pass
+
+    def _popen(argv, **kwargs):
         calls.append(argv)
         rc, out = queue.pop(0) if queue else (0, "done")
-        return _R(rc, out)
+        return _FakeProc(rc, out)
 
-    monkeypatch.setattr("subprocess.run", _run)
+    monkeypatch.setattr("subprocess.Popen", _popen)
     return calls
 
 
@@ -202,3 +216,101 @@ def test_headless_run_cannot_wait_for_permission(card, monkeypatch):
 def test_missing_task_is_fatal_not_silent(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_does_not_exist")
     assert bridge.main() == 2
+
+
+def test_runtime_settings_come_from_the_dispatcher(card, monkeypatch):
+    """★ The dispatcher resolved the binary and model against the ROOT config
+    and passed them down; we must use its answer.
+
+    We run with HERMES_HOME pointing at the assignee's profile, and Hermes
+    profiles do not inherit — they merge onto DEFAULT_CONFIG, never onto the
+    root's. A bridge that re-derives this reads a different file than the
+    process that decided the card was spawnable, so a card validates, spawns,
+    and then dies with "binary not found" because the profile's config never
+    carried the path.
+    """
+    monkeypatch.setenv("HERMES_OPENCODE_COMMAND", "/opt/oc/opencode")
+    monkeypatch.setenv("HERMES_OPENCODE_MODEL", "prov/model-x")
+    monkeypatch.setenv("HERMES_OPENCODE_EXTRA_ARGS", '["--pure"]')
+    calls = _fake_opencode(monkeypatch, (0, "done"))
+    _gate_returns(monkeypatch)
+
+    bridge.main()
+    argv = calls[0]
+    assert argv[0] == "/opt/oc/opencode"
+    assert argv[argv.index("--model") + 1] == "prov/model-x"
+    assert "--pure" in argv
+
+
+def test_opencode_output_is_streamed_to_the_worker_log(card, monkeypatch, capsys):
+    """A card is minutes of work. If its log only appears once the run ends,
+    nobody watching `hermes kanban log` can tell working from hung — which is
+    the one question a worker log must answer."""
+    _fake_opencode(monkeypatch, (0, "step one\nstep two\nstep three\n"))
+    _gate_returns(monkeypatch)
+
+    bridge.main()
+    out = capsys.readouterr().out
+    assert "step one" in out and "step three" in out
+
+
+def test_a_wedged_opencode_is_killed(card, monkeypatch):
+    """★ The watchdog must not depend on OpenCode saying anything.
+
+    We consume its pipe ourselves, so a CLI that wedges silently would block on
+    readline forever with no deadline ever checked — the card holds its claim
+    until the TTL expires. The kill has to come from a timer, not from the loop.
+    """
+    killed = {"v": False}
+
+    class _Wedged:
+        def __init__(self):
+            self._ev = threading.Event()
+            # A generator body does not run until the first next(), so this
+            # blocks when the bridge READS the pipe — not when it opens it.
+            # (Blocking in __init__ instead would hang inside Popen, before
+            # the watchdog is even armed, and prove nothing.)
+            self.stdout = self._block()
+
+        def _block(self):
+            self._ev.wait(10)   # released only by kill()
+            return
+            yield               # unreachable — makes this a generator
+
+        def wait(self, timeout=None):
+            return -9
+
+        def kill(self):
+            killed["v"] = True
+            self._ev.set()
+
+    def _popen(argv, **kwargs):
+        return _Wedged()
+
+    monkeypatch.setattr("subprocess.Popen", _popen)
+    monkeypatch.setattr(bridge, "DEFAULT_TIMEOUT", 1)
+    _gate_returns(monkeypatch)
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET max_runtime_seconds=1 WHERE id=?", (card,))
+        conn.commit()
+
+    bridge.main()
+    assert killed["v"], "a silently wedged opencode was never killed"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, card).status != "done"
+
+
+def test_card_model_override_beats_the_default(card, monkeypatch):
+    """Same precedence a Hermes card's model_override gets."""
+    monkeypatch.setenv("HERMES_OPENCODE_MODEL", "prov/default")
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET model_override=? WHERE id=?",
+                     ("prov/special", card))
+        conn.commit()
+    calls = _fake_opencode(monkeypatch, (0, "done"))
+    _gate_returns(monkeypatch)
+
+    bridge.main()
+    argv = calls[0]
+    assert argv[argv.index("--model") + 1] == "prov/special"

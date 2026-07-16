@@ -50,6 +50,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -102,22 +103,53 @@ def _prompt_for(task) -> str:
     return "\n".join(parts)
 
 
-def _opencode_argv(task, prompt: str, *, continue_session: bool) -> list[str]:
+def _runtime_settings() -> tuple[str, Optional[str], list]:
+    """(command, default_model, extra_args).
+
+    The dispatcher resolved these against the ROOT config and passed them in —
+    prefer that. We run with HERMES_HOME pointed at the assignee's profile, and
+    Hermes profiles do not inherit config, so re-deriving here would read a
+    different file than the process that decided this card was spawnable.
+    Config is only consulted as a fallback (a bridge run by hand, an older
+    dispatcher).
+    """
+    cmd = os.environ.get("HERMES_OPENCODE_COMMAND", "").strip()
+    model = os.environ.get("HERMES_OPENCODE_MODEL", "").strip() or None
+    extra_raw = os.environ.get("HERMES_OPENCODE_EXTRA_ARGS", "").strip()
+    extra: list = []
+    if extra_raw:
+        try:
+            import json
+
+            extra = json.loads(extra_raw)
+        except ValueError:
+            extra = shlex.split(extra_raw)
+    if cmd:
+        return cmd, model, extra
+
     from hermes_cli.kanban_worker_runtimes import _resolve_command, _runtime_config
 
     cfg = _runtime_config("opencode")
-    argv = [_resolve_command("opencode") or "opencode", "run"]
+    return (
+        _resolve_command("opencode") or "opencode",
+        model or cfg.get("default_model"),
+        extra or cfg.get("extra_args") or [],
+    )
+
+
+def _opencode_argv(task, prompt: str, *, continue_session: bool) -> list[str]:
+    command, default_model, extra = _runtime_settings()
+    argv = [command, "run"]
     if continue_session:
         argv.append("--continue")
     # Per-card override beats the configured default — same precedence as a
     # Hermes card's model_override.
-    model = task.model_override or cfg.get("default_model")
+    model = task.model_override or default_model
     if model:
         argv += ["--model", str(model)]
     # Headless means nobody can answer a permission prompt: without this the
     # run blocks on the first edit and dies at the timeout having done nothing.
     argv.append("--auto")
-    extra = cfg.get("extra_args") or []
     if isinstance(extra, str):
         extra = shlex.split(extra)
     argv += [str(a) for a in extra]
@@ -127,25 +159,57 @@ def _opencode_argv(task, prompt: str, *, continue_session: bool) -> list[str]:
 
 def _run_opencode(task, prompt: str, *, continue_session: bool,
                   timeout: int) -> tuple[int, str]:
+    """Run OpenCode, streaming its output to the worker log as it arrives.
+
+    Streamed, not captured: a card is minutes of work, and a log that stays
+    empty until the run ends is indistinguishable from a hung worker to anyone
+    watching `hermes kanban log`. That is the one question a worker log has to
+    be able to answer.
+
+    The timeout is a watchdog thread rather than `subprocess.run(timeout=...)`
+    because we are consuming the pipe ourselves: an agent CLI that wedges with
+    no output would otherwise block on readline forever, with the deadline
+    never checked.
+    """
     argv = _opencode_argv(task, prompt, continue_session=continue_session)
     _log(f"$ {' '.join(shlex.quote(a) for a in argv[:-1])} <prompt {len(prompt)}b>")
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
             cwd=os.environ.get("HERMES_KANBAN_WORKSPACE") or None,
             stdin=subprocess.DEVNULL,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout,
+            bufsize=1,
         )
     except FileNotFoundError:
         return 127, "opencode binary not found"
-    except subprocess.TimeoutExpired:
+
+    timed_out = threading.Event()
+
+    def _kill() -> None:
+        timed_out.set()
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(timeout, _kill)
+    watchdog.start()
+    chunks: list[str] = []
+    try:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            chunks.append(line)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        rc = proc.wait()
+    finally:
+        watchdog.cancel()
+
+    if timed_out.is_set():
         return 124, f"opencode timed out after {timeout}s"
-    out = (proc.stdout or "") + (proc.stderr or "")
-    # The transcript belongs in the worker log, not just in our head.
-    print(out, flush=True)
-    return proc.returncode, out
+    return rc, "".join(chunks)
 
 
 def _run_id() -> Optional[int]:
