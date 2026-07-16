@@ -17757,7 +17757,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         config = getattr(self, "config", None)
         if not getattr(config, "multiplex_profiles", False):
             return None
-        routes = getattr(config, "profile_routes", None)
+        # Runtime bindings (`/profile <name>` typed in a chat) are merged with
+        # the static config routes and matched by the same matcher — one answer
+        # to "which profile serves this message", from two sources. Read per
+        # message (mtime-cached) so a binding takes effect on the NEXT message
+        # rather than the next restart, which is the whole point of it.
+        from gateway.profile_bindings import merged_routes
+
+        try:
+            routes = merged_routes(getattr(config, "profile_routes", None))
+        except Exception:
+            logger.warning("profile bindings unreadable; using static routes only",
+                           exc_info=True)
+            routes = getattr(config, "profile_routes", None)
         if not routes:
             return None
         from gateway.profile_routing import match_profile_route
