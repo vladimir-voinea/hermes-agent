@@ -223,46 +223,63 @@ def _run_id() -> Optional[int]:
 def _gate(task_id: str, summary: str) -> Optional[str]:
     """Fire the host's pre_tool_call hooks for kanban_complete.
 
-    Returns the block reason, or None to proceed. Errors here fail OPEN and
-    say so: a broken hook must not strand a card that did its work. (The
-    guards that matter fail closed on their own side — see the merge gate.)
+    Returns the block reason, or None to proceed. An ERROR here is NOT an
+    allow: we cannot tell "no hook objected" from "the gate never ran", and
+    the second one silently completing is how a guard becomes decorative. It
+    is reported as a block, naming the fault.
     """
-    try:
-        from hermes_cli.plugins import resolve_pre_tool_block
+    from hermes_cli.plugins import resolve_pre_tool_block
 
-        return resolve_pre_tool_block(
-            "kanban_complete",
-            {"task_id": task_id, "summary": summary},
-            task_id=task_id,
-            session_id=f"opencode:{task_id}",
-        )
-    except Exception as exc:
-        _log(f"WARNING: completion gate errored, allowing: {exc!r}")
-        return None
+    return resolve_pre_tool_block(
+        "kanban_complete",
+        {"task_id": task_id, "summary": summary},
+        task_id=task_id,
+        session_id=f"opencode:{task_id}",
+    )
+
+
+class GateUnavailable(RuntimeError):
+    """The completion gate could not be established. Never allow past this."""
 
 
 def _bootstrap_hooks() -> None:
     """Load plugins + shell hooks, the way the CLI does at startup.
 
-    Without this the gate is a no-op that always allows — which would look
-    exactly like a passing gate. The dispatcher spawns us with
-    HERMES_ACCEPT_HOOKS=1 for the same reason it passes `--accept-hooks` to a
-    Hermes worker: a worker has no TTY to approve a hook at.
+    ★ FAILURE HERE IS FATAL, and that is deliberate.
+
+    Without this, `resolve_pre_tool_block` returns None for everything — not
+    because nothing objected, but because nothing was ever asked. That is a
+    gate that silently always passes, which is strictly worse than no gate at
+    all: the card completes carrying the implication it was checked.
+
+    So a raising bootstrap => GateUnavailable => the card blocks with the
+    reason. A bootstrap that SUCCEEDS and finds no hooks is entirely different
+    and entirely fine: that host has nothing to enforce, and we proceed.
+
+    The dispatcher spawns us with HERMES_ACCEPT_HOOKS=1 for the same reason it
+    passes `--accept-hooks` to a Hermes worker: a worker has no TTY to approve
+    a hook at, and un-approved hooks would silently not register.
     """
     accept = os.environ.get("HERMES_ACCEPT_HOOKS", "").lower() in {"1", "true", "yes", "on"}
+    if not accept:
+        raise GateUnavailable(
+            "HERMES_ACCEPT_HOOKS is not set, so this worker's shell hooks would "
+            "not register and its completion gate would pass everything "
+            "unchecked. The dispatcher sets this; a hand-run bridge must too."
+        )
     try:
         from hermes_cli.plugins import discover_plugins
 
         discover_plugins()
     except Exception as exc:
-        _log(f"WARNING: plugin discovery failed: {exc!r}")
+        raise GateUnavailable(f"plugin discovery failed: {exc!r}") from exc
     try:
         from agent.shell_hooks import register_from_config
         from hermes_cli.config import load_config
 
         register_from_config(load_config(), accept_hooks=accept)
     except Exception as exc:
-        _log(f"WARNING: shell-hook registration failed: {exc!r}")
+        raise GateUnavailable(f"shell-hook registration failed: {exc!r}") from exc
 
 
 def main() -> int:
@@ -280,7 +297,27 @@ def main() -> int:
         _log(f"FATAL: no such task {task_id}")
         return 2
 
-    _bootstrap_hooks()
+    # Before spending a model on the work: if we cannot establish the gate, we
+    # must not be the thing that closes this card.
+    try:
+        _bootstrap_hooks()
+    except GateUnavailable as exc:
+        _log(f"FATAL: {exc}")
+        with kb.connect(board=board) as conn:
+            kb.block_task(
+                conn, task_id,
+                reason=(
+                    f"COMPLETION GATE UNAVAILABLE — refusing to run. {exc}\n\n"
+                    f"This is a host/config fault, not a problem with the work. "
+                    f"An OpenCode worker cannot close its own card, so this "
+                    f"bridge closes it — and it will not do that while unable to "
+                    f"apply the same checks a Hermes worker's completion gets. "
+                    f"Fix the host, then unblock this card."
+                ),
+                kind="capability",
+                expected_run_id=_run_id(),
+            )
+        return 2
 
     timeout = int(task.max_runtime_seconds or DEFAULT_TIMEOUT)
     prompt = _prompt_for(task)
@@ -305,7 +342,26 @@ def main() -> int:
             return 1
 
         summary = out[-SUMMARY_CHARS:].strip() or "opencode run completed."
-        reason = _gate(task_id, summary)
+        try:
+            reason = _gate(task_id, summary)
+        except Exception as exc:
+            # We cannot distinguish "nothing objected" from "nothing ran".
+            # Completing here would attach the gate's implied blessing to a card
+            # nobody checked, so the card goes to a human instead.
+            _log(f"FATAL: the completion gate itself errored: {exc!r}")
+            with kb.connect(board=board) as conn:
+                kb.block_task(
+                    conn, task_id,
+                    reason=(
+                        f"THE COMPLETION GATE ERRORED — this card is not being "
+                        f"completed, because nobody can say whether it should be: "
+                        f"{exc!r}\n\nThe work itself may be fine; the branch is "
+                        f"intact. Fix the gate and unblock."
+                    ),
+                    kind="capability",
+                    expected_run_id=_run_id(),
+                )
+            return 1
         if reason is None:
             with kb.connect(board=board) as conn:
                 kb.complete_task(

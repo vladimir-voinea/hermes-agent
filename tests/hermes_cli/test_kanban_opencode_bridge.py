@@ -37,8 +37,14 @@ def kanban_home(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_hook_bootstrap(monkeypatch):
-    """Don't load the host's real plugins/hooks into the test process."""
+    """Don't load the host's real plugins/hooks into the test process.
+
+    Yields the REAL function: the tests that assert bootstrap's own fail-closed
+    behaviour must call the thing, not this stub.
+    """
+    real = bridge._bootstrap_hooks
     monkeypatch.setattr(bridge, "_bootstrap_hooks", lambda: None)
+    return real
 
 
 @pytest.fixture
@@ -216,6 +222,67 @@ def test_headless_run_cannot_wait_for_permission(card, monkeypatch):
 def test_missing_task_is_fatal_not_silent(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_does_not_exist")
     assert bridge.main() == 2
+
+
+# ---------------------------------------------------------------------------
+# No silent fallbacks: a gate that cannot run must not read as a gate that passed
+# ---------------------------------------------------------------------------
+
+def test_unloadable_hooks_block_the_card(card, monkeypatch):
+    """★ If the gate cannot be established, do not run and do not complete.
+
+    resolve_pre_tool_block returns None both when nothing objected and when
+    nothing was ever asked. Treating the second as an allow is how a guard
+    becomes decorative: the card closes carrying the implication it was checked.
+    """
+    monkeypatch.setattr(bridge, "_bootstrap_hooks",
+                        lambda: (_ for _ in ()).throw(
+                            bridge.GateUnavailable("plugin discovery failed: boom")))
+    calls = _fake_opencode(monkeypatch, (0, "done"))
+
+    assert bridge.main() == 2
+    assert calls == [], "spent a model on work it could never legitimately close"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, card)
+    assert task.status != "done"
+    assert task.status in {"blocked", "triage"}
+
+
+def test_unapproved_hooks_are_not_silently_absent(card, monkeypatch, no_hook_bootstrap):
+    """★ HERMES_ACCEPT_HOOKS unset => shell hooks never register => the gate
+    passes everything while looking exactly like a gate that found nothing to
+    object to. That must be loud, not lucky."""
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    with pytest.raises(bridge.GateUnavailable):
+        no_hook_bootstrap()
+
+
+def test_a_gate_that_errors_does_not_complete_the_card(card, monkeypatch):
+    """★ An erroring gate is not an allow — the card goes to a human."""
+    _fake_opencode(monkeypatch, (0, "done"))
+
+    def _boom(tool_name, args, **kwargs):
+        raise RuntimeError("hook subsystem exploded")
+
+    monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block", _boom)
+
+    assert bridge.main() == 1
+    with kb.connect() as conn:
+        task = kb.get_task(conn, card)
+    assert task.status != "done", "an unchecked card was completed"
+    assert task.status in {"blocked", "triage"}
+
+
+def test_bootstrap_with_no_hooks_configured_is_fine(card, monkeypatch, no_hook_bootstrap):
+    """The mirror image, and the reason this is not just 'fail closed always':
+    a host that HAS no hooks has nothing to enforce. Bootstrap succeeding and
+    finding nothing is a normal, working setup — only a bootstrap that RAISES
+    is unknowable."""
+    monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr("agent.shell_hooks.register_from_config",
+                        lambda cfg, accept_hooks=False: None)
+    no_hook_bootstrap()   # must not raise
 
 
 def test_runtime_settings_come_from_the_dispatcher(card, monkeypatch):
