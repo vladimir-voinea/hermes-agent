@@ -8786,6 +8786,15 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # A worker's role="user" turns are the ORCHESTRATOR's task prompt, not a
+    # human's — there is no user in this process. Memory providers gate fact
+    # writes on agent_context (MemoryProvider.initialize), so tag the child
+    # honestly: without this it defaults to "primary" and the extractor mines
+    # machine-generated task text into durable "user facts" ("The user is
+    # working on kanban task t_6e338e52"). Session summaries are still allowed
+    # for contexts a provider opts into via its activity_log_contexts.
+    env["HERMES_AGENT_CONTEXT"] = "worker"
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without

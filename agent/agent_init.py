@@ -1483,11 +1483,23 @@ def init_agent(
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 if agent._memory_manager.providers:
+                    # agent_context tells the provider WHO is talking, so it can
+                    # refuse to shape the user model from machine-generated text.
+                    # "primary" means a real human session; providers gate fact
+                    # writes on it (see MemoryProvider.initialize's contract).
+                    # Set via env by out-of-process spawners — currently only the
+                    # kanban dispatcher ("worker"). In-process contexts (cron
+                    # jobs, which run inside the gateway) can't be tagged this way
+                    # and still arrive as "primary"; they need the caller to pass
+                    # agent_context explicitly.
+                    _agent_context = (
+                        os.environ.get("HERMES_AGENT_CONTEXT", "").strip() or "primary"
+                    )
                     _init_kwargs = {
                         "session_id": agent.session_id,
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
-                        "agent_context": "primary",
+                        "agent_context": _agent_context,
                     }
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning
