@@ -259,13 +259,26 @@ def test_external_runtime_no_assignee_still_spawns(
 
 
 def test_external_runtime_no_adapter_fails_closed(
-    kanban_home, opencode_enabled, all_spawnable
+    kanban_home, all_spawnable, monkeypatch
 ):
-    """With no spawn adapter registered for opencode (ticket 02 ships only
-    the Hermes adapter), dispatching an opencode task records a spawn
-    failure — the circuit breaker path — rather than silently no-op'ing."""
+    """A known runtime with NO spawn adapter records a spawn failure — the
+    circuit-breaker path — rather than silently no-op'ing.
+
+    Uses a throwaway runtime rather than a real one: this asserts the
+    *registry's* fail-closed behaviour, so it must keep testing that even
+    after every shipped runtime has an adapter. (It once used ``opencode``,
+    which stopped being an example of "no adapter" the moment one landed —
+    a test that silently changes meaning is worse than no test.)
+    """
+    from hermes_cli import kanban_worker_runtimes as rt
+
+    monkeypatch.setitem(
+        rt._REGISTRY, "ghost", rt.WorkerRuntime(name="ghost", external=True)
+    )
+    monkeypatch.setattr(rt, "is_runtime_enabled", lambda name: True)
+
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="oc no-adapter", worker_runtime="opencode")
+        tid = kb.create_task(conn, title="ghost no-adapter", worker_runtime="ghost")
         res = kb.dispatch_once(conn)  # no spawn_fn override
         task = kb.get_task(conn, tid)
 
@@ -273,6 +286,135 @@ def test_external_runtime_no_adapter_fails_closed(
     assert task.status == "ready"
     assert task.consecutive_failures >= 1
     assert tid in [t for t in res.auto_blocked] or task.consecutive_failures >= 1
+
+
+# ---------------------------------------------------------------------------
+# The OpenCode adapter
+# ---------------------------------------------------------------------------
+
+def _oc_task(tmp_path, **over):
+    base = dict(
+        id="t_oc", title="x", body=None, assignee=None,
+        status="ready", priority=0, created_by=None, created_at=0,
+        started_at=None, completed_at=None, workspace_kind="worktree",
+        workspace_path=str(tmp_path / "ws"), claim_lock=None,
+        claim_expires=None, tenant=None, branch_name="wt/t_oc",
+        worker_runtime="opencode",
+    )
+    base.update(over)
+    return kb.Task(**base)
+
+
+def test_opencode_adapter_spawns_the_bridge_not_opencode(tmp_path, monkeypatch):
+    """★ The PID handed to the dispatcher must be the lifecycle bridge.
+
+    Spawning `opencode run` directly is the obvious implementation and it is
+    broken: OpenCode has no kanban tools, so that process would do the work,
+    exit, and never resolve its card — leaving it `running` until the claim
+    expires and it is re-run, forever. The bridge is what closes the card, so
+    the bridge is what the dispatcher must be watching.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    (tmp_path / "ws").mkdir()
+
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            self.pid = 777
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+    pid = kb.resolve_spawn_adapter("opencode").spawn(
+        _oc_task(tmp_path), str(tmp_path / "ws")
+    )
+
+    assert pid == 777
+    assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_opencode_bridge"]
+    assert "run" not in captured["cmd"], "spawned opencode directly, not the bridge"
+
+
+def test_opencode_adapter_preserves_board_pins(tmp_path, monkeypatch):
+    """A runtime swap changes who does the work, not how the board talks to
+    it: the bridge gets the same board/workspace pins a Hermes worker gets."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    (tmp_path / "ws").mkdir()
+
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            self.pid = 778
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    kb.resolve_spawn_adapter("opencode").spawn(
+        _oc_task(tmp_path, current_run_id=9), str(tmp_path / "ws")
+    )
+
+    env = captured["env"]
+    assert env["HERMES_KANBAN_TASK"] == "t_oc"
+    assert env["HERMES_KANBAN_DB"] == str(home / "kanban.db")
+    assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(home / "kanban" / "workspaces")
+    assert env["HERMES_KANBAN_BRANCH"] == "wt/t_oc"
+    assert env["HERMES_KANBAN_RUN_ID"] == "9"
+    assert env["HERMES_AGENT_CONTEXT"] == "worker"
+    # ★ Without this the bridge's completion gate registers no shell hooks and
+    #   allows everything — a gate that silently always passes.
+    assert env["HERMES_ACCEPT_HOOKS"] == "1"
+
+
+def test_opencode_adapter_survives_missing_assignee(tmp_path, monkeypatch):
+    """External runtimes may omit the assignee — spawning must not require a
+    Hermes profile to resolve."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    (tmp_path / "ws").mkdir()
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            self.pid = 779
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    assert kb.resolve_spawn_adapter("opencode").spawn(
+        _oc_task(tmp_path, assignee=None), str(tmp_path / "ws")
+    ) == 779
+
+
+def test_opencode_task_dispatches_under_registry(
+    kanban_home, opencode_enabled, all_spawnable, monkeypatch
+):
+    """End-to-end through the dispatcher: an opencode card reaches `running`
+    with the bridge's PID recorded — no assignee, no profile."""
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            self.pid = 31337
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="oc card", worker_runtime="opencode")
+        kb.dispatch_once(conn)
+        task = kb.get_task(conn, tid)
+
+    assert task.status == "running"
+    assert task.worker_pid == 31337
 
 
 # ---------------------------------------------------------------------------

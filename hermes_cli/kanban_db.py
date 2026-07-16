@@ -8943,11 +8943,101 @@ def _is_external_runtime(runtime: Optional[str]) -> bool:
     return is_external_runtime(runtime)
 
 
+def _opencode_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn the OpenCode lifecycle bridge; return its PID.
+
+    OpenCode has no kanban tools, so we do NOT exec ``opencode run`` here: the
+    dispatcher would watch a PID that exits without ever resolving its card,
+    and the card would be re-run forever. The PID we return is
+    :mod:`hermes_cli.kanban_opencode_bridge`, which runs OpenCode and then
+    closes the card from the outside. See that module for why it also fires
+    the host's ``kanban_complete`` hooks.
+
+    The env contract is deliberately the same one :func:`_default_spawn`
+    builds — same board pins, same workspace pins, same log file. A worker
+    runtime should be a swap of *who does the work*, not of how the board
+    talks to it.
+    """
+    import subprocess
+
+    env = dict(os.environ)
+
+    # An external runtime may have no assignee (the create path allows it).
+    # When it does have one, honour it: the profile decides which hooks the
+    # bridge's completion gate will fire, so `tech` gets tech's guards.
+    if task.assignee:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile_arg = normalize_profile_name(task.assignee)
+        try:
+            env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        except FileNotFoundError:
+            pass
+        env["HERMES_PROFILE"] = profile_arg
+
+    if task.tenant:
+        env["HERMES_TENANT"] = task.tenant
+    env["HERMES_KANBAN_TASK"] = task.id
+    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+        env["TERMINAL_CWD"] = workspace
+    if task.branch_name:
+        env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    if task.current_run_id is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if task.claim_lock:
+        env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    env["HERMES_KANBAN_BOARD"] = _normalize_board_slug(board) or get_current_board()
+    env["HERMES_AGENT_CONTEXT"] = "worker"
+    # The bridge has no TTY to approve a shell hook at — same reason the Hermes
+    # worker is spawned with `--accept-hooks`. Without this its completion gate
+    # silently registers nothing and allows everything.
+    env["HERMES_ACCEPT_HOOKS"] = "1"
+    env.pop("HERMES_TUI", None)
+
+    cmd = [sys.executable, "-m", "hermes_cli.kanban_opencode_bridge"]
+
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{task.id}.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+            cmd,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except Exception:
+        log_f.close()
+        raise
+    # As in _default_spawn: the child inherits the FD and keeps writing after
+    # we return, so we must not close it here.
+    return proc.pid
+
+
 # Register the Hermes adapter — the historic spawn path. Done at import
 # time so the dispatcher always has a default. ``_default_spawn`` is
 # defined above, so the reference is stable.
 register_spawn_adapter(
     SpawnAdapter(name="hermes", external=False, spawn=_default_spawn)
+)
+register_spawn_adapter(
+    SpawnAdapter(name="opencode", external=True, spawn=_opencode_spawn)
 )
 
 
