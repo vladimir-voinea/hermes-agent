@@ -1834,7 +1834,10 @@ DEFAULT_CONFIG = {
         # when an exchange was tool-heavy. Set False to restore the legacy
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
-        "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # LOCAL PATCH (diverges from upstream, which defaults to "interrupt"):
+        # an unset or unrecognized value must never interrupt a running turn.
+        # Explicit "interrupt" is still honored.
+        "busy_input_mode": "steer",  # interrupt | queue | steer
         # When busy_input_mode="steer", suppress only the visible
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.
