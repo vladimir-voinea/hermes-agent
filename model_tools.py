@@ -316,6 +316,15 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        # Profile-multiplexed gateways resolve a different plugin-tool
+        # visibility set per profile (see foreign_profile_plugin_tool_names),
+        # so the memo key must carry the profile scope. Always None outside
+        # multiplex mode — single-profile cache behavior is unchanged.
+        try:
+            from hermes_cli.plugins import current_profile_scope_key
+            profile_scope = current_profile_scope_key()
+        except Exception:
+            profile_scope = None
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
@@ -323,6 +332,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            profile_scope,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -440,6 +450,20 @@ def _compute_tool_definitions(
     # all check the tool registry for plugin-provided toolsets.  No bypass
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
+
+    # Multiplex profile isolation: plugin tools loaded by ANOTHER profile's
+    # plugin manager are logically absent for this profile's turns.  The
+    # process-global tool registry holds every profile's plugin tools, so
+    # without this subtraction a `tech` turn would see (and could call) the
+    # orchestrator profile's tools.  Empty set when multiplexing is off.
+    try:
+        from hermes_cli.plugins import foreign_profile_plugin_tool_names
+        _foreign_plugin_tools = foreign_profile_plugin_tool_names()
+    except Exception:
+        logger.warning("foreign plugin-tool resolution failed", exc_info=True)
+        _foreign_plugin_tools = set()
+    if _foreign_plugin_tools:
+        tools_to_include.difference_update(_foreign_plugin_tools)
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
@@ -1166,6 +1190,19 @@ def handle_function_call(
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
+
+        # Multiplex profile isolation (defense in depth): a plugin tool owned
+        # exclusively by ANOTHER profile does not exist for this turn, even if
+        # a stale schema or a crafted call names it. Mirrors the registry's
+        # unknown-tool error so absence is indistinguishable from
+        # nonexistence. No-op (empty set) when multiplexing is off.
+        try:
+            from hermes_cli.plugins import foreign_profile_plugin_tool_names
+            _foreign_tools = foreign_profile_plugin_tool_names()
+        except Exception:
+            _foreign_tools = set()
+        if function_name in _foreign_tools:
+            return json.dumps({"error": f"Unknown tool: {function_name}"})
 
         # Check plugin hooks for a block/approve directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to

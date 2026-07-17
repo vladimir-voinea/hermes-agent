@@ -386,8 +386,17 @@ def _hermetic_environment(tmp_path, monkeypatch):
     try:
         import hermes_cli.plugins as _plugins_mod
         monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
+        # Per-profile managers (multiplex gateway) are keyed on tempdir paths
+        # that die with the test — drop them so a later test can't resolve a
+        # stale manager for a recycled tmp path.
+        monkeypatch.setattr(_plugins_mod, "_profile_plugin_managers", {})
     except Exception:
         pass
+    # Same for the gateway's per-profile plugin/hook setup memo, if the
+    # gateway module happens to be imported in this process.
+    _gw_run = sys.modules.get("gateway.run")
+    if _gw_run is not None and hasattr(_gw_run, "_profile_plugin_runtime_ready"):
+        monkeypatch.setattr(_gw_run, "_profile_plugin_runtime_ready", set())
     # Explicitly clear provider-specific base URL overrides that don't match
     # the generic credential-shaped env-var filter above.
     monkeypatch.delenv("GMI_API_KEY", raising=False)

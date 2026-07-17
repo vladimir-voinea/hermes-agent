@@ -1469,6 +1469,90 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_hermes_home_override(home_token)
 
 
+# Profile homes whose plugin + shell-hook runtime has been set up in this
+# process (normalized paths). Guarded by the lock; membership makes
+# _ensure_profile_plugin_runtime an idempotent no-op, so it is safe to call
+# from the per-turn path (worker threads included).
+_profile_plugin_runtime_ready: set = set()
+_profile_plugin_runtime_lock = threading.Lock()
+
+
+def _ensure_profile_plugin_runtime(profile_home: "Path") -> None:
+    """Discover plugins and register shell hooks for one profile, once.
+
+    The multiplexed gateway scopes each routed turn's config/skills/secrets
+    via ``_profile_runtime_scope``, but plugin discovery and shell-hook
+    registration are process-level acts: they populate the profile's own
+    PluginManager (see ``hermes_cli.plugins.get_plugin_manager``), which the
+    turn's hook/tool lookups then resolve through the same home override.
+    Without this, a routed turn gets the profile's model/config but NEITHER
+    its plugins NOR its ``pre_tool_call`` guards — the guards silently never
+    fire (issue this function exists to fix).
+
+    Idempotent per profile home and thread-safe. No-op when multiplexing is
+    off, and for the process's own base home (the default profile), which the
+    normal gateway startup path already sets up. Failures are logged at
+    WARNING — a guard that silently fails to register is the exact bug this
+    prevents — but never propagate: a broken profile must not take down the
+    gateway or wedge the turn.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+        if not is_multiplex_active():
+            return
+    except Exception:
+        return
+
+    try:
+        key = os.path.realpath(os.path.expanduser(str(profile_home)))
+    except (OSError, ValueError):
+        key = str(profile_home)
+
+    if key in _profile_plugin_runtime_ready:
+        return
+    with _profile_plugin_runtime_lock:
+        if key in _profile_plugin_runtime_ready:
+            return
+        try:
+            with _profile_runtime_scope(Path(profile_home)):
+                from hermes_cli.plugins import (
+                    current_profile_scope_key,
+                    discover_plugins,
+                )
+
+                if current_profile_scope_key() is None:
+                    # Base home (default profile) — handled by the normal
+                    # startup path; never re-scope the root manager here.
+                    _profile_plugin_runtime_ready.add(key)
+                    return
+
+                try:
+                    discover_plugins()
+                except Exception:
+                    logger.warning(
+                        "[MULTIPLEX] plugin discovery failed for profile home "
+                        "%s — that profile's plugin tools/commands/hooks will "
+                        "be missing this run", profile_home, exc_info=True,
+                    )
+                try:
+                    from hermes_cli.config import load_config
+                    from agent.shell_hooks import register_from_config
+
+                    register_from_config(load_config(), accept_hooks=False)
+                except Exception:
+                    logger.warning(
+                        "[MULTIPLEX] shell-hook registration failed for "
+                        "profile home %s — that profile's configured hooks "
+                        "WILL NOT fire this run", profile_home, exc_info=True,
+                    )
+        except Exception:
+            logger.warning(
+                "[MULTIPLEX] profile plugin/hook runtime setup failed for %s",
+                profile_home, exc_info=True,
+            )
+        _profile_plugin_runtime_ready.add(key)
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner.
 
@@ -7157,6 +7241,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=True,
             )
 
+        # Multiplex mode: the two calls above populated the DEFAULT profile's
+        # plugin manager and hooks from the root home. Every OTHER served
+        # profile gets its own manager + hook set, discovered under its own
+        # HERMES_HOME — matching what `hermes -p <name>` does in its own
+        # process. Eager (here, before adapters start) so the first routed
+        # turn doesn't pay discovery in the hot path; the per-turn
+        # _ensure_profile_plugin_runtime call in
+        # _resolve_profile_home_for_source stays a cheap idempotent no-op and
+        # only does real work for profiles created after startup.
+        self._setup_profile_plugin_runtimes()
+
         # Discover and load event hooks
         self.hooks.discover_and_load()
 
@@ -8708,6 +8803,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
+
+    def _setup_profile_plugin_runtimes(self) -> None:
+        """Eagerly set up plugins + shell hooks for every served profile.
+
+        No-op unless ``gateway.multiplex_profiles`` is on. Runs at startup,
+        before adapters connect, so each profile's PluginManager is populated
+        (plugins discovered under its home, shell hooks from its config.yaml
+        registered) by the time its first turn fires. Per-profile failures are
+        contained and logged inside ``_ensure_profile_plugin_runtime`` — one
+        broken profile must not take down the gateway.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+
+            for _profile_name, _profile_home in profiles_to_serve(multiplex=True):
+                _ensure_profile_plugin_runtime(_profile_home)
+        except Exception:
+            logger.warning(
+                "per-profile plugin/hook setup failed at gateway startup — "
+                "secondary profiles may be missing their plugins and hooks",
+                exc_info=True,
+            )
 
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.
@@ -10404,13 +10523,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
-                    user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
-                    return str(result) if result else None
+                _plugin_cmd = command.replace("_", "-")
+                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    # Resolve AND run the handler under the routed profile's
+                    # scope: each profile's plugin manager registers its own
+                    # commands, and the handler may read profile config/state.
+                    # Single-profile gateways never enter this branch.
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        plugin_handler = get_plugin_command_handler(_plugin_cmd)
+                        if plugin_handler:
+                            user_args = event.get_command_args().strip()
+                            result = plugin_handler(user_args)
+                            if asyncio.iscoroutine(result):
+                                result = await result
+                            return str(result) if result else None
+                else:
+                    plugin_handler = get_plugin_command_handler(_plugin_cmd)
+                    if plugin_handler:
+                        user_args = event.get_command_args().strip()
+                        result = plugin_handler(user_args)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                        return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
 
@@ -17842,6 +17978,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(source, "guild_id", None),
                 )
                 return get_hermes_home()
+            # Safety net for profiles created (or bound via /profile) after
+            # gateway startup: make sure this profile's plugins + shell hooks
+            # are registered before the caller enters its runtime scope.
+            # Idempotent set-membership no-op for profiles the startup pass
+            # already covered; self-gated on multiplex being active.
+            _ensure_profile_plugin_runtime(profile_dir)
             return profile_dir
         except Exception:
             # Catch normalization errors, path errors, etc.
