@@ -1,0 +1,5 @@
+name: kimi-oauth-provider
+kind: model-provider
+version: 1.0.0
+description: Kimi Code (OAuth · coding plan)
+author: Nous Research

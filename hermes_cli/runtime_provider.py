@@ -33,6 +33,7 @@ from hermes_cli.auth import (
     resolve_codex_runtime_credentials,
     resolve_xai_oauth_runtime_credentials,
     resolve_qwen_runtime_credentials,
+    resolve_kimi_oauth_runtime_credentials,
     resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
     has_usable_secret,
@@ -1835,6 +1836,24 @@ def resolve_runtime_provider(
             if requested_provider != "auto":
                 raise
             logger.info("Qwen OAuth credentials failed; "
+                        "falling through to next provider.")
+
+    if provider == "kimi-oauth":
+        try:
+            creds = resolve_kimi_oauth_runtime_credentials()
+            return {
+                "provider": "kimi-oauth",
+                "api_mode": "chat_completions",
+                "base_url": creds.get("base_url", "").rstrip("/"),
+                "api_key": creds.get("api_key", ""),
+                "source": creds.get("source", "kimi-code-cli"),
+                "expires_at": creds.get("expires_at"),
+                "requested_provider": requested_provider,
+            }
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            logger.info("Kimi OAuth credentials failed; "
                         "falling through to next provider.")
 
     if provider == "minimax-oauth":

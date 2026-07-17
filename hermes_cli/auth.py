@@ -121,6 +121,13 @@ XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 3600
 QWEN_OAUTH_CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
 QWEN_OAUTH_TOKEN_URL = "https://chat.qwen.ai/api/v1/oauth2/token"
 QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+DEFAULT_KIMI_OAUTH_HOST = "https://auth.kimi.com"
+DEFAULT_KIMI_OAUTH_BASE_URL = "https://api.kimi.com/coding/v1"
+# Kimi Code access tokens live only 900s, so every session refreshes. 300s
+# matches the Kimi CLI's own refresh threshold — staying in step with it keeps
+# the two clients from fighting over the (rotating) refresh token.
+KIMI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 300
 DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL = "https://accounts.spotify.com"
 DEFAULT_SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1"
 DEFAULT_SPOTIFY_REDIRECT_URI = "http://127.0.0.1:43827/spotify/callback"
@@ -208,6 +215,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="Qwen OAuth",
         auth_type="oauth_external",
         inference_base_url=DEFAULT_QWEN_BASE_URL,
+    ),
+    "kimi-oauth": ProviderConfig(
+        id="kimi-oauth",
+        name="Kimi Code (OAuth · coding plan)",
+        auth_type="oauth_external",
+        inference_base_url=DEFAULT_KIMI_OAUTH_BASE_URL,
+        client_id=KIMI_OAUTH_CLIENT_ID,
     ),
     "lmstudio": ProviderConfig(
         id="lmstudio",
@@ -1768,6 +1782,8 @@ def resolve_provider(
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
+        "kimi-code": "kimi-oauth", "kimi-code-oauth": "kimi-oauth",
+        "kimi-coding-oauth": "kimi-oauth",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
         "tencent": "tencent-tokenhub", "tokenhub": "tencent-tokenhub",
@@ -2498,6 +2514,300 @@ def get_qwen_auth_status() -> Dict[str, Any]:
             "source": creds.get("source"),
             "api_key": creds.get("api_key"),
             "expires_at_ms": creds.get("expires_at_ms"),
+        }
+    except AuthError as exc:
+        return {
+            "logged_in": False,
+            "auth_file": str(auth_path),
+            "error": str(exc),
+        }
+
+
+# =============================================================================
+# Kimi Code auth — reuses the Kimi CLI's OAuth login (~/.kimi-code)
+# =============================================================================
+
+# Reentrancy tracker for the Kimi credential-file lock. Kept separate from the
+# auth-store holders so a reentrant acquisition of one lock never silently
+# skips the other's kernel-level flock (see _file_lock).
+_kimi_oauth_lock_holder = threading.local()
+
+
+def _kimi_oauth_token_url() -> str:
+    """Return the Kimi OAuth token endpoint.
+
+    Env is read at call time (not import time) so tests and per-host overrides
+    take effect without reimporting the module.
+    """
+    host = (
+        os.getenv("KIMI_CODE_OAUTH_HOST", "").strip()
+        or os.getenv("KIMI_OAUTH_HOST", "").strip()
+        or DEFAULT_KIMI_OAUTH_HOST
+    )
+    return f"{host.rstrip('/')}/api/oauth/token"
+
+
+def _kimi_cli_home() -> Path:
+    home = os.getenv("KIMI_CODE_HOME", "").strip()
+    return Path(home) if home else Path.home() / ".kimi-code"
+
+
+def _kimi_cli_auth_path() -> Path:
+    return _kimi_cli_home() / "credentials" / "kimi-code.json"
+
+
+def _kimi_cli_lock_path() -> Path:
+    # NOT "oauth/kimi-code.lock" — that name belongs to the Kimi CLI's own
+    # proper-lockfile. This is a Hermes-side lock over the same credential file.
+    return _kimi_cli_home() / "oauth" / "kimi-code.hermes.lock"
+
+
+@contextmanager
+def _kimi_oauth_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+    """Cross-process lock for one Kimi read→decide→refresh→write transaction.
+
+    Every Hermes profile and the Kimi CLI share a single credential file whose
+    refresh token rotates on use, so the refresh path must be serialized.
+    """
+    with _file_lock(
+        _kimi_cli_lock_path(),
+        _kimi_oauth_lock_holder,
+        timeout_seconds,
+        "Timed out waiting for Kimi OAuth credential lock",
+    ):
+        yield
+
+
+def _read_kimi_cli_tokens() -> Dict[str, Any]:
+    auth_path = _kimi_cli_auth_path()
+    if not auth_path.exists():
+        raise AuthError(
+            "Kimi CLI credentials not found. Run 'kimi' and complete the login first.",
+            provider="kimi-oauth",
+            code="kimi_auth_missing",
+        )
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise AuthError(
+            f"Failed to read Kimi CLI credentials from {auth_path}: {exc}",
+            provider="kimi-oauth",
+            code="kimi_auth_read_failed",
+        ) from exc
+    if not isinstance(data, dict):
+        raise AuthError(
+            f"Invalid Kimi CLI credentials in {auth_path}.",
+            provider="kimi-oauth",
+            code="kimi_auth_invalid",
+        )
+    return data
+
+
+def _save_kimi_cli_tokens(tokens: Dict[str, Any]) -> Path:
+    """Write the Kimi CLI credential file, preserving its exact key shape.
+
+    The Kimi CLI reads this file back, so the six keys it writes must survive
+    round-tripping through Hermes untouched.
+    """
+    auth_path = _kimi_cli_auth_path()
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
+    secure_parent_dir(auth_path)
+    # Per-process random temp suffix avoids collisions between concurrent
+    # writers and stale leftovers from a crashed prior write.
+    tmp_path = auth_path.with_name(f"{auth_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    # Create with 0o600 atomically via os.open(O_EXCL) — closes the TOCTOU
+    # window where write_text() + post-write chmod briefly exposed tokens
+    # at process umask (typically 0o644). See #19673, #21148.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(tokens, indent=2, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        atomic_replace(tmp_path, auth_path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+    return auth_path
+
+
+def _kimi_access_token_is_expiring(
+    expires_at: Any, skew_seconds: int = KIMI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS
+) -> bool:
+    # NOTE: Kimi's expires_at is UNIX **SECONDS**, unlike Qwen's expiry_date
+    # (milliseconds). Comparing seconds against a ms clock makes any token look
+    # valid for ~56,000 years, and every inference call then 401s.
+    try:
+        expires_at_seconds = int(expires_at)
+    except Exception:
+        return True
+    return time.time() + max(0, int(skew_seconds)) >= expires_at_seconds
+
+
+def _refresh_kimi_cli_tokens(tokens: Dict[str, Any], timeout_seconds: float = 20.0) -> Dict[str, Any]:
+    """Exchange the refresh token for a new access token and persist the result.
+
+    The refresh token ROTATES: a successful refresh returns a new one and spends
+    the old one. The new pair must be persisted before it is used, or the user's
+    Kimi CLI is left holding a dead token and gets logged out.
+    """
+    refresh_token = str(tokens.get("refresh_token", "") or "").strip()
+    if not refresh_token:
+        raise AuthError(
+            "Kimi OAuth refresh token missing. Re-run 'kimi' and complete the login.",
+            provider="kimi-oauth",
+            code="kimi_refresh_token_missing",
+        )
+
+    try:
+        response = httpx.post(
+            _kimi_oauth_token_url(),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            data={
+                "client_id": KIMI_OAUTH_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        raise AuthError(
+            f"Kimi OAuth refresh failed: {exc}",
+            provider="kimi-oauth",
+            code="kimi_refresh_failed",
+        ) from exc
+
+    if response.status_code >= 400:
+        body = response.text.strip()
+        raise AuthError(
+            "Kimi OAuth refresh failed. Re-run 'kimi' and complete the login."
+            + (f" Response: {body}" if body else ""),
+            provider="kimi-oauth",
+            code="kimi_refresh_failed",
+        )
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise AuthError(
+            f"Kimi OAuth refresh returned invalid JSON: {exc}",
+            provider="kimi-oauth",
+            code="kimi_refresh_invalid_json",
+        ) from exc
+
+    if not isinstance(payload, dict) or not str(payload.get("access_token", "") or "").strip():
+        raise AuthError(
+            "Kimi OAuth refresh response missing access_token.",
+            provider="kimi-oauth",
+            code="kimi_refresh_invalid_response",
+        )
+
+    expires_in = payload.get("expires_in")
+    try:
+        expires_in_seconds = int(expires_in)
+    except Exception:
+        expires_in_seconds = 900
+    expires_in_seconds = max(1, expires_in_seconds)
+
+    # The endpoint returns expires_in, never expires_at — we derive it.
+    refreshed = {
+        "access_token": str(payload.get("access_token", "") or "").strip(),
+        "refresh_token": str(payload.get("refresh_token", refresh_token) or refresh_token).strip(),
+        "expires_at": int(time.time()) + expires_in_seconds,
+        "expires_in": expires_in_seconds,
+        "scope": str(payload.get("scope", tokens.get("scope", "kimi-code")) or "kimi-code").strip(),
+        "token_type": str(payload.get("token_type", tokens.get("token_type", "Bearer")) or "Bearer").strip() or "Bearer",
+    }
+    _save_kimi_cli_tokens(refreshed)
+    return refreshed
+
+
+def _mark_kimi_oauth_active(creds: Dict[str, Any]) -> None:
+    """Set active_provider to kimi-oauth in auth.json.
+
+    Kimi OAuth tokens live in the Kimi CLI credential file managed by
+    _save_kimi_cli_tokens / resolve_kimi_oauth_runtime_credentials. This
+    function only writes a minimal provider-state entry (base_url for display)
+    and sets active_provider so that get_active_provider() and
+    _model_section_has_credentials() detect the provider for the setup wizard
+    and status commands.
+    """
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        state: Dict[str, Any] = {}
+        if creds.get("base_url"):
+            state["base_url"] = str(creds["base_url"])
+        _save_provider_state(auth_store, "kimi-oauth", state)
+        _save_auth_store(auth_store)
+
+
+def resolve_kimi_oauth_runtime_credentials(
+    *,
+    force_refresh: bool = False,
+    refresh_if_expiring: bool = True,
+    refresh_skew_seconds: int = KIMI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+) -> Dict[str, Any]:
+    tokens = _read_kimi_cli_tokens()
+    should_refresh = bool(force_refresh)
+    if not should_refresh and refresh_if_expiring:
+        should_refresh = _kimi_access_token_is_expiring(tokens.get("expires_at"), refresh_skew_seconds)
+
+    if should_refresh:
+        # Serialize the refresh itself: the refresh token rotates, and all
+        # Hermes profiles plus the Kimi CLI share this one file.
+        with _kimi_oauth_lock():
+            # Re-read under the lock — a peer may have rotated the pair while we
+            # waited. Spending our now-stale refresh token would revoke theirs.
+            tokens = _read_kimi_cli_tokens()
+            if force_refresh or (
+                refresh_if_expiring
+                and _kimi_access_token_is_expiring(tokens.get("expires_at"), refresh_skew_seconds)
+            ):
+                tokens = _refresh_kimi_cli_tokens(tokens)
+
+    access_token = str(tokens.get("access_token", "") or "").strip()
+    if not access_token:
+        raise AuthError(
+            "Kimi OAuth access token missing. Re-run 'kimi' and complete the login.",
+            provider="kimi-oauth",
+            code="kimi_access_token_missing",
+        )
+
+    base_url = os.getenv("KIMI_CODE_BASE_URL", "").strip().rstrip("/") or DEFAULT_KIMI_OAUTH_BASE_URL
+    return {
+        "provider": "kimi-oauth",
+        "base_url": base_url,
+        "api_key": access_token,
+        "source": "kimi-code-cli",
+        "expires_at": tokens.get("expires_at"),
+        "auth_file": str(_kimi_cli_auth_path()),
+    }
+
+
+def get_kimi_oauth_auth_status() -> Dict[str, Any]:
+    auth_path = _kimi_cli_auth_path()
+    try:
+        # Validate the runtime credentials, including refresh when the cached
+        # CLI token is expired. Otherwise stale tokens show up as "logged in"
+        # and `hermes model` walks users into a broken Kimi setup flow.
+        creds = resolve_kimi_oauth_runtime_credentials(refresh_if_expiring=True)
+        return {
+            "logged_in": True,
+            "auth_file": str(auth_path),
+            "source": creds.get("source"),
+            "api_key": creds.get("api_key"),
+            "expires_at": creds.get("expires_at"),
         }
     except AuthError as exc:
         return {
@@ -6415,6 +6725,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_xai_oauth_auth_status()
     if target == "qwen-oauth":
         return get_qwen_auth_status()
+    if target == "kimi-oauth":
+        return get_kimi_oauth_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
