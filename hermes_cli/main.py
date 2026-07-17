@@ -623,6 +623,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_openai_codex,
     _model_flow_xai_oauth,
     _model_flow_qwen_oauth,
+    _model_flow_kimi_oauth,
     _model_flow_minimax_oauth,
     _model_flow_custom,
     _model_flow_azure_foundry,
@@ -3150,6 +3151,8 @@ def select_provider_and_model(args=None):
         _model_flow_xai_oauth(config, current_model, args=args)
     elif selected_provider == "qwen-oauth":
         _model_flow_qwen_oauth(config, current_model)
+    elif selected_provider == "kimi-oauth":
+        _model_flow_kimi_oauth(config, current_model)
     elif selected_provider == "minimax-oauth":
         _model_flow_minimax_oauth(config, current_model, args=args)
     elif selected_provider == "copilot-acp":
@@ -3680,6 +3683,12 @@ def _prompt_provider_choice(choices, *, default=0, title="Select provider:"):
 _DEFAULT_QWEN_PORTAL_MODELS = [
     "qwen3-coder-plus",
     "qwen3-coder",
+]
+
+_DEFAULT_KIMI_OAUTH_MODELS = [
+    "k3",
+    "kimi-for-coding",
+    "kimi-for-coding-highspeed",
 ]
 
 
@@ -12542,7 +12551,7 @@ def _build_provider_choices() -> list[str]:
             "anthropic", "gemini", "vertex", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
-            "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
+            "nvidia", "deepseek", "alibaba", "qwen-oauth", "kimi-oauth", "opencode-zen", "opencode-go",
         ]
 
 

@@ -157,6 +157,10 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "deepseek": "deepseek",
     "alibaba": "alibaba",
     "qwen-oauth": "alibaba",
+    # Kimi Code OAuth is an authentication path for the same Kimi coding-plan
+    # model catalog as ``kimi-coding``, so metadata resolves through the same
+    # models.dev namespace.
+    "kimi-oauth": "kimi-for-coding",
     "copilot": "github-copilot",
     "opencode-zen": "opencode",
     "opencode-go": "opencode-go",

@@ -771,6 +771,64 @@ def _model_flow_qwen_oauth(_config, current_model=""):
     else:
         print("No change.")
 
+
+def _model_flow_kimi_oauth(_config, current_model=""):
+    """Kimi Code OAuth provider: reuse local Kimi CLI login, then pick model.
+
+    Mirrors _model_flow_qwen_oauth.  Hermes never runs a Kimi login of its own
+    — it only reuses the token the Kimi CLI writes to
+    ~/.kimi-code/credentials/kimi-code.json — so an unauthenticated user is
+    pointed at the Kimi CLI's own login, not at `hermes auth add`.
+    """
+    from hermes_cli.main import _DEFAULT_KIMI_OAUTH_MODELS
+    from hermes_cli.auth import (
+        get_kimi_oauth_auth_status,
+        resolve_kimi_oauth_runtime_credentials,
+        _prompt_model_selection,
+        _save_model_choice,
+        _update_config_for_provider,
+        DEFAULT_KIMI_OAUTH_BASE_URL,
+    )
+    from hermes_cli.models import fetch_api_models
+
+    status = get_kimi_oauth_auth_status()
+    if not status.get("logged_in"):
+        print("Not logged into Kimi Code OAuth.")
+        print("Run: kimi   — then complete its login.")
+        auth_file = status.get("auth_file")
+        if auth_file:
+            print(f"Expected credentials file: {auth_file}")
+        if status.get("error"):
+            print(f"Error: {status.get('error')}")
+        return
+
+    # Try live model discovery, fall back to curated list.
+    models = None
+    try:
+        creds = resolve_kimi_oauth_runtime_credentials(refresh_if_expiring=True)
+        models = fetch_api_models(creds["api_key"], creds["base_url"])
+    except Exception:
+        pass
+    if not models:
+        models = list(_DEFAULT_KIMI_OAUTH_MODELS)
+
+    # Prefer k3 — the Kimi CLI's own default_model and the only 1M-context
+    # model here. Live discovery returns kimi-for-coding first, so a bare
+    # models[0] would quietly offer the weaker model as the default.
+    default = current_model or ("k3" if "k3" in models else (models[0] if models else "k3"))
+    selected = _prompt_model_selection(
+        models,
+        current_model=default,
+        confirm_provider="kimi-oauth",
+        confirm_base_url=DEFAULT_KIMI_OAUTH_BASE_URL,
+    )
+    if selected:
+        _save_model_choice(selected)
+        _update_config_for_provider("kimi-oauth", DEFAULT_KIMI_OAUTH_BASE_URL)
+        print(f"Default model set to: {selected} (via Kimi Code OAuth)")
+    else:
+        print("No change.")
+
 def _model_flow_minimax_oauth(config, current_model="", args=None):
     """MiniMax OAuth provider: ensure logged in, then pick model."""
     from hermes_cli.auth import (

@@ -2044,6 +2044,43 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         except Exception as exc:
             logger.debug("Qwen OAuth token seed failed: %s", exc)
 
+    elif provider == "kimi-oauth":
+        # Kimi Code OAuth tokens live in ~/.kimi-code/credentials/kimi-code.json,
+        # written by the Kimi CLI's own login.  They aren't in the Hermes auth
+        # store or env vars, so resolve them here.
+        # Use refresh_if_expiring=False to avoid network calls during
+        # pool loading / provider discovery.
+        try:
+            from hermes_cli.auth import resolve_kimi_oauth_runtime_credentials
+            creds = resolve_kimi_oauth_runtime_credentials(refresh_if_expiring=False)
+            token = creds.get("api_key", "")
+            if token:
+                source_name = creds.get("source", "kimi-code-cli")
+                if not _is_suppressed(provider, source_name):
+                    # Kimi's expires_at is UNIX SECONDS while the pool tracks
+                    # milliseconds, so scale it.  A corrupt CLI file must not
+                    # cost us the (still usable) token, so fall back to None.
+                    try:
+                        kimi_expires_at_ms = int(creds["expires_at"]) * 1000
+                    except (KeyError, TypeError, ValueError):
+                        kimi_expires_at_ms = None
+                    active_sources.add(source_name)
+                    changed |= _upsert_entry(
+                        entries,
+                        provider,
+                        source_name,
+                        {
+                            "source": source_name,
+                            "auth_type": AUTH_TYPE_OAUTH,
+                            "access_token": token,
+                            "expires_at_ms": kimi_expires_at_ms,
+                            "base_url": creds.get("base_url", ""),
+                            "label": creds.get("auth_file", source_name),
+                        },
+                    )
+        except Exception as exc:
+            logger.debug("Kimi OAuth token seed failed: %s", exc)
+
     elif provider == "minimax-oauth":
         # MiniMax OAuth tokens live in ~/.hermes/auth.json providers.minimax-oauth.
         # Seed the pool so `/auth list` reflects the logged-in state and the

@@ -329,6 +329,11 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2-turbo-preview",
         "kimi-k2-0905-preview",
     ],
+    "kimi-oauth": [
+        "k3",
+        "kimi-for-coding",
+        "kimi-for-coding-highspeed",
+    ],
     "kimi-coding-cn": [
         "kimi-k2.6",
         "kimi-k2.5",
@@ -1088,6 +1093,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("bedrock",        "AWS Bedrock",              "AWS Bedrock (Claude, Nova, Llama, DeepSeek; IAM or API key)"),
     ProviderEntry("azure-foundry",  "Azure Foundry",            "Azure Foundry (OpenAI-style or Anthropic-style endpoint, your Azure AI deployment)"),
     ProviderEntry("qwen-oauth",     "Qwen OAuth (Portal)",      "Qwen OAuth (Reuses local Qwen CLI login)"),
+    ProviderEntry("kimi-oauth",     "Kimi Code (OAuth)",        "Kimi Code OAuth (Reuses local Kimi CLI login, coding plan)"),
 ]
 
 # Auto-extend CANONICAL_PROVIDERS with any provider registered in providers/
@@ -1267,6 +1273,9 @@ _PROVIDER_ALIASES = {
     "qwen": "alibaba",
     "alibaba-cloud": "alibaba",
     "qwen-portal": "qwen-oauth",
+    "kimi-code": "kimi-oauth",
+    "kimi-code-oauth": "kimi-oauth",
+    "kimi-coding-oauth": "kimi-oauth",
     "hf": "huggingface",
     "hugging-face": "huggingface",
     "huggingface-hub": "huggingface",

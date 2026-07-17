@@ -197,16 +197,19 @@ def show_status(args):
             get_nous_auth_status,
             get_codex_auth_status,
             get_qwen_auth_status,
+            get_kimi_oauth_auth_status,
             get_minimax_oauth_auth_status,
         )
         nous_status = get_nous_auth_status()
         codex_status = get_codex_auth_status()
         qwen_status = get_qwen_auth_status()
+        kimi_oauth_status = get_kimi_oauth_auth_status()
         minimax_status = get_minimax_oauth_auth_status()
     except Exception:
         nous_status = {}
         codex_status = {}
         qwen_status = {}
+        kimi_oauth_status = {}
         minimax_status = {}
 
     nous_account_info = None
@@ -290,6 +293,23 @@ def show_status(args):
         print(f"    Access exp: {datetime.fromtimestamp(int(qwen_exp) / 1000, tz=timezone.utc).isoformat()}")
     if qwen_status.get("error") and not qwen_logged_in:
         print(f"    Error:      {qwen_status.get('error')}")
+
+    kimi_oauth_logged_in = bool(kimi_oauth_status.get("logged_in"))
+    print(
+        f"  {'Kimi OAuth':<12}  {check_mark(kimi_oauth_logged_in)} "
+        f"{'logged in' if kimi_oauth_logged_in else 'not logged in (run: kimi, then complete its login)'}"
+    )
+    kimi_oauth_auth_file = kimi_oauth_status.get("auth_file")
+    if kimi_oauth_auth_file:
+        print(f"    Auth file:  {kimi_oauth_auth_file}")
+    # Kimi's expires_at is UNIX SECONDS — unlike Qwen's expiry_date above,
+    # which is milliseconds.  Do not divide by 1000 here.
+    kimi_oauth_exp = kimi_oauth_status.get("expires_at")
+    if kimi_oauth_exp:
+        from datetime import datetime, timezone
+        print(f"    Access exp: {datetime.fromtimestamp(int(kimi_oauth_exp), tz=timezone.utc).isoformat()}")
+    if kimi_oauth_status.get("error") and not kimi_oauth_logged_in:
+        print(f"    Error:      {kimi_oauth_status.get('error')}")
 
     minimax_logged_in = bool(minimax_status.get("logged_in"))
     print(
