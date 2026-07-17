@@ -81,6 +81,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://portal.qwen.ai/v1",
         base_url_env_var="HERMES_QWEN_BASE_URL",
     ),
+    "kimi-oauth": HermesOverlay(
+        transport="openai_chat",
+        auth_type="oauth_external",
+        base_url_override="https://api.kimi.com/coding/v1",
+        base_url_env_var="KIMI_CODE_BASE_URL",
+    ),
     "lmstudio": HermesOverlay(
         transport="openai_chat",
         auth_type="api_key",

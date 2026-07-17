@@ -34,7 +34,7 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth"}
+_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "kimi-oauth", "minimax-oauth"}
 
 
 def _get_custom_provider_names() -> list:
@@ -378,6 +378,27 @@ def auth_add_command(args) -> None:
             auth_type=AUTH_TYPE_OAUTH,
             priority=0,
             source=f"{SOURCE_MANUAL}:qwen_cli",
+            access_token=creds["api_key"],
+            base_url=creds.get("base_url"),
+        )
+        pool.add_entry(entry)
+        print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
+        return
+
+    if provider == "kimi-oauth":
+        creds = auth_mod.resolve_kimi_oauth_runtime_credentials(refresh_if_expiring=False)
+        auth_mod._mark_kimi_oauth_active(creds)
+        label = (getattr(args, "label", None) or "").strip() or label_from_token(
+            creds["api_key"],
+            _oauth_default_label(provider, len(pool.entries()) + 1),
+        )
+        entry = PooledCredential(
+            provider=provider,
+            id=uuid.uuid4().hex[:6],
+            label=label,
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=f"{SOURCE_MANUAL}:kimi_code_cli",
             access_token=creds["api_key"],
             base_url=creds.get("base_url"),
         )

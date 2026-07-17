@@ -50,6 +50,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "gemini", "ollama-cloud", "zai", "kimi-coding", "kimi-coding-cn", "stepfun", "minimax", "minimax-oauth", "minimax-cn", "anthropic", "deepseek", "deepinfra",
     "opencode-zen", "opencode-go", "kilocode", "alibaba", "novita",
     "qwen-oauth",
+    "kimi-oauth",
     "xiaomi",
     "arcee",
     "gmi",

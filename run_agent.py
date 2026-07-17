@@ -328,6 +328,24 @@ def _qwen_portal_headers() -> dict:
     }
 
 
+def _kimi_coding_headers(provider: str = "") -> dict:
+    """Return default HTTP headers for api.kimi.com.
+
+    Kimi's Anthropic-protocol ``/coding`` endpoint requires
+    ``User-Agent: claude-code/0.1.0`` (see agent/anthropic_adapter.py), and the
+    sk-kimi api-key path is redirected onto the same host, so that spoof stays
+    the default here.
+
+    The OpenAI-compat ``/coding/v1`` endpoint used by ``kimi-oauth`` imposes no
+    such requirement — verified against the live service: claude-code/0.1.0, a
+    hermes UA, an invented UA and no UA at all are all answered 200 alike. So
+    we identify honestly rather than claim to be someone else's client.
+    """
+    if provider == "kimi-oauth":
+        return {"User-Agent": "hermes-agent/1.0"}
+    return {"User-Agent": "claude-code/0.1.0"}
+
+
 def _safe_session_filename_component(session_id: str) -> str:
     """Return a stable, path-safe filename component for a session ID.
 
@@ -4553,7 +4571,9 @@ class AIAgent:
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "api.kimi.com"):
-            self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+            self._client_kwargs["default_headers"] = _kimi_coding_headers(
+                getattr(self, "provider", "") or ""
+            )
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "chatgpt.com"):

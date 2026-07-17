@@ -8450,6 +8450,18 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "status_fn": None,  # dispatched via auth.get_qwen_auth_status
     },
     {
+        "id": "kimi-oauth",
+        "name": "Kimi Code (via Kimi CLI)",
+        "flow": "external",
+        # Hermes has no browser login for Kimi — it only reuses the token the
+        # Kimi CLI writes to ~/.kimi-code/credentials/kimi-code.json.  So the
+        # command to surface is the Kimi CLI's own login, the same way the
+        # copilot-acp / claude-code cards point at their owning CLI.
+        "cli_command": "kimi",
+        "docs_url": "https://www.kimi.com/coding",
+        "status_fn": None,  # dispatched via auth.get_kimi_oauth_auth_status
+    },
+    {
         "id": "minimax-oauth",
         "name": "MiniMax (OAuth)",
         # MiniMax's flow is structurally device-code (verification URI +
@@ -8542,6 +8554,17 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
                 "token_preview": _truncate_token(raw.get("access_token")),
                 "expires_at": raw.get("expires_at"),
                 "has_refresh_token": bool(raw.get("has_refresh_token")),
+            }
+        if provider_id == "kimi-oauth":
+            raw = hauth.get_kimi_oauth_auth_status()
+            return {
+                "logged_in": bool(raw.get("logged_in")),
+                "source": raw.get("source") or "kimi_code_cli",
+                "source_label": raw.get("auth_file") or "Kimi CLI",
+                "token_preview": _truncate_token(raw.get("api_key")),
+                # Kimi's expires_at is UNIX seconds, not milliseconds.
+                "expires_at": raw.get("expires_at"),
+                "has_refresh_token": True,
             }
         if provider_id == "minimax-oauth":
             raw = hauth.get_minimax_oauth_auth_status()

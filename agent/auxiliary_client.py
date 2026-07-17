@@ -6175,6 +6175,7 @@ def _resolve_task_provider_model(
                 "anthropic",
                 "copilot",
                 "copilot-acp",
+                "kimi-oauth",
                 "minimax-oauth",
                 "nous",
                 "openai-codex",
