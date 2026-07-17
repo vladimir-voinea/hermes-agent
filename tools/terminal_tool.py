@@ -1087,6 +1087,57 @@ _session_cwd: Dict[str, str] = {}
 _session_cwd_lock = threading.Lock()
 
 
+# --- durable backing store -------------------------------------------------
+# The in-memory map above is the fast path and the source of truth for a live
+# process. It is ALSO mirrored to a small JSON file so a session's cwd survives
+# a gateway restart: a Telegram topic's session_key is stable across restarts,
+# so `/cd`ing a topic once is remembered forever instead of being lost on the
+# next bounce (the `/cd` reply used to literally say "not persisted across a
+# gateway restart yet"). Every file access is best-effort and never raises —
+# the worst case degrades to the old in-memory-only behaviour.
+
+def _session_cwd_store() -> "Path":
+    from pathlib import Path
+    try:
+        from hermes_cli.config import get_default_hermes_root
+        root = Path(get_default_hermes_root())
+    except Exception:
+        root = Path(os.path.expanduser("~/.hermes"))
+    return root / "session-cwds.json"
+
+
+def _session_cwd_read_all() -> Dict[str, str]:
+    import json
+    try:
+        p = _session_cwd_store()
+        if p.is_file():
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()
+                        if isinstance(v, str) and v.strip()}
+    except Exception:
+        pass
+    return {}
+
+
+def _session_cwd_persist(key: str, cwd: str) -> None:
+    """Read-modify-write one entry, so keys owned by other processes and
+    entries cleared from THIS process's memory are preserved on disk."""
+    import json
+    try:
+        data = _session_cwd_read_all()
+        if data.get(key) == cwd:
+            return
+        data[key] = cwd
+        p = _session_cwd_store()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
 def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """Record *cwd* as the working directory of *session_key*.
 
@@ -1094,7 +1145,8 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     command completes (the env's post-command tracking has just parsed the
     resulting cwd) and when a surface registers a workspace cwd override.
     Empty/None session keys collapse to ``"default"`` (single-session CLI).
-    Non-string / empty cwds are ignored.
+    Non-string / empty cwds are ignored. Mirrored to the durable store (only
+    when the value actually changes) so it survives a gateway restart.
     """
     if not isinstance(cwd, str) or not cwd.strip():
         return
@@ -1102,6 +1154,7 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     with _session_cwd_lock:
         if _session_cwd.get(key) != cwd:
             _session_cwd[key] = cwd
+            _session_cwd_persist(key, cwd)
 
 
 def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
@@ -1109,11 +1162,19 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
 
     No fallback chain here on purpose: callers decide what an absent record
     means (config default, TERMINAL_CWD seed, process cwd). ``None``/empty
-    keys read the ``"default"`` record.
+    keys read the ``"default"`` record. An in-memory miss consults the durable
+    store (survives a gateway restart) and repopulates, so a topic's `/cd` is
+    remembered without a re-`/cd` after a bounce.
     """
     key = str(session_key or "default")
     with _session_cwd_lock:
-        return _session_cwd.get(key)
+        v = _session_cwd.get(key)
+        if v is not None:
+            return v
+        v = _session_cwd_read_all().get(key)
+        if v:
+            _session_cwd[key] = v
+        return v
 
 
 def clear_session_cwd(session_key: str) -> None:

@@ -10531,14 +10531,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
                 _plugin_cmd = command.replace("_", "-")
-                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-                    # Resolve AND run the handler under the routed profile's
-                    # scope: each profile's plugin manager registers its own
-                    # commands, and the handler may read profile config/state.
-                    # Single-profile gateways never enter this branch.
-                    with _profile_runtime_scope(
-                        self._resolve_profile_home_for_source(source)
-                    ):
+                # Plugin slash commands are dispatched HERE, in _handle_message,
+                # BEFORE the agent turn pins session context (_set_session_env
+                # runs only in _handle_message_with_agent). A plugin command
+                # handler receives only raw_args — no task_id/session_id — so
+                # without help it resolves the gateway daemon's OWN cwd and
+                # ignores this topic's /cd (e.g. /orchestrator refusing "not a
+                # git repository" right after a good /cd). Built-in commands like
+                # /cd already receive _quick_key; give plugin commands the same
+                # session by pinning this topic's logical cwd on the contextvar
+                # Hermes' canonical resolver (agent.runtime_cwd.resolve_agent_cwd)
+                # reads. Best-effort; reset in finally; a per-Task contextvar, so
+                # it never leaks across concurrently-handled messages.
+                _cwd_token = None
+                try:
+                    from agent.runtime_cwd import set_session_cwd
+                    from tools.terminal_tool import get_session_cwd as _get_scwd
+                    _topic_cwd = _get_scwd(_quick_key)
+                    if _topic_cwd:
+                        _cwd_token = set_session_cwd(_topic_cwd)
+                except Exception:
+                    _cwd_token = None
+                try:
+                    if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                        # Resolve AND run the handler under the routed profile's
+                        # scope: each profile's plugin manager registers its own
+                        # commands, and the handler may read profile config/state.
+                        # Single-profile gateways never enter this branch.
+                        with _profile_runtime_scope(
+                            self._resolve_profile_home_for_source(source)
+                        ):
+                            plugin_handler = get_plugin_command_handler(_plugin_cmd)
+                            if plugin_handler:
+                                user_args = event.get_command_args().strip()
+                                result = plugin_handler(user_args)
+                                if asyncio.iscoroutine(result):
+                                    result = await result
+                                return str(result) if result else None
+                    else:
                         plugin_handler = get_plugin_command_handler(_plugin_cmd)
                         if plugin_handler:
                             user_args = event.get_command_args().strip()
@@ -10546,14 +10576,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if asyncio.iscoroutine(result):
                                 result = await result
                             return str(result) if result else None
-                else:
-                    plugin_handler = get_plugin_command_handler(_plugin_cmd)
-                    if plugin_handler:
-                        user_args = event.get_command_args().strip()
-                        result = plugin_handler(user_args)
-                        if asyncio.iscoroutine(result):
-                            result = await result
-                        return str(result) if result else None
+                finally:
+                    if _cwd_token is not None:
+                        try:
+                            from agent.runtime_cwd import _SESSION_CWD
+                            _SESSION_CWD.reset(_cwd_token)
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
 
