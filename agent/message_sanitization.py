@@ -432,6 +432,43 @@ def _strip_images_from_messages(messages: list) -> bool:
     return found
 
 
+def _strip_audio_from_messages(messages: list) -> bool:
+    """Replace input_audio content parts with a text note in-place.
+
+    Called when a server rejects ``input_audio`` content with a 4xx error
+    (audio-blind endpoint, or an audio-native model behind a text-only
+    frontend).  Mutates messages so the next API call sends no audio.
+
+    Unlike ``_strip_images_from_messages`` the part is replaced with a
+    text note rather than deleted — the sibling text part carries an
+    ``[Audio message attached at: <path>]`` hint, and the note points the
+    model back at that file so it can still transcribe via tools.
+
+    Returns True if any audio parts were replaced.
+    """
+    found = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        # Pull the path hint from the sibling text part, if present.
+        path = ""
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                m = re.search(r"\[Audio message attached at: (.+?)\]", str(part.get("text", "")))
+                if m:
+                    path = m.group(1)
+                    break
+        note = "[audio message removed — endpoint rejected audio" + (f"; file at {path}]" if path else "]")
+        for i, part in enumerate(content):
+            if isinstance(part, dict) and part.get("type") == "input_audio":
+                content[i] = {"type": "text", "text": note}
+                found = True
+    return found
+
+
 def _sanitize_structure_non_ascii(payload: Any) -> bool:
     """Strip non-ASCII characters from nested dict/list payloads in-place."""
     found = False

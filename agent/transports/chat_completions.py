@@ -18,6 +18,65 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
+def _apply_custom_reasoning_control(
+    extra_body: dict,
+    reasoning_control: dict | None,
+    reasoning_config: dict | None,
+) -> None:
+    """Drive a custom OpenAI-compat engine's native thinking knobs from /reasoning.
+
+    Bridges Hermes' provider-agnostic reasoning lever (``reasoning_config``:
+    ``{"enabled": False}`` for /reasoning none, ``{"enabled": True, "effort": <level>}``
+    otherwise) onto whatever the engine natively accepts, as declared per-provider
+    in ``reasoning_control``:
+
+        toggle_kwarg   -- chat_template_kwargs bool that turns thinking on/off
+                          (e.g. ``enable_thinking`` for GLM/Qwen vLLM templates)
+        effort_param   -- top-level request field for effort (e.g. ``reasoning_effort``)
+        effort_map     -- Hermes level (minimal/low/medium/high/xhigh/max) -> engine value
+        default_effort -- level used when /reasoning is unset
+
+    Mutates ``extra_body`` in place. ``reasoning_effort`` is emitted inside
+    ``extra_body`` (top-level of the JSON body vLLM sees), not the OpenRouter
+    ``extra_body.reasoning`` shape. No-op unless ``reasoning_control`` is a dict.
+    """
+    if not isinstance(reasoning_control, dict) or not reasoning_control:
+        return
+
+    toggle_kwarg = str(reasoning_control.get("toggle_kwarg", "") or "").strip()
+    effort_param = str(reasoning_control.get("effort_param", "") or "").strip()
+    effort_map = reasoning_control.get("effort_map")
+    if not isinstance(effort_map, dict):
+        effort_map = {}
+    default_effort = str(reasoning_control.get("default_effort", "medium") or "medium").strip().lower()
+
+    # Resolve enabled + effort from the runtime lever, falling back to default.
+    enabled = True
+    effort = default_effort
+    if isinstance(reasoning_config, dict):
+        if reasoning_config.get("enabled") is False:
+            enabled = False
+        else:
+            effort = str(reasoning_config.get("effort") or default_effort).strip().lower()
+
+    if not enabled:
+        if toggle_kwarg:
+            ctk = extra_body.setdefault("chat_template_kwargs", {})
+            if isinstance(ctk, dict):
+                ctk[toggle_kwarg] = False
+        return
+
+    # Thinking on.
+    if toggle_kwarg:
+        ctk = extra_body.setdefault("chat_template_kwargs", {})
+        if isinstance(ctk, dict):
+            ctk[toggle_kwarg] = True
+    if effort_param and effort:
+        mapped = effort_map.get(effort, effort)
+        if mapped not in (None, ""):
+            extra_body[effort_param] = mapped
+
+
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
     """Return the model's wire-compatible reasoning config."""
     if not isinstance(reasoning_config, dict):
@@ -493,6 +552,16 @@ class ChatCompletionsTransport(ProviderTransport):
             elif raw_thinking_config:
                 extra_body["thinking_config"] = raw_thinking_config
 
+        # Per-provider reasoning lever for custom OpenAI-compat engines: map
+        # /reasoning (none/effort) onto native knobs (enable_thinking +
+        # reasoning_effort). Gated on the provider declaring reasoning_control
+        # (only resolved for custom providers); known providers
+        # (OpenRouter/Kimi/Gemini/…) are untouched. Runs after the standard
+        # reasoning block so it wins for these engines.
+        _rc = params.get("reasoning_control")
+        if _rc:
+            _apply_custom_reasoning_control(extra_body, _rc, reasoning_config)
+
         # Merge any pre-built extra_body additions
         additions = params.get("extra_body_additions")
         if additions:
@@ -614,6 +683,15 @@ class ChatCompletionsTransport(ProviderTransport):
         additions = params.get("extra_body_additions")
         if additions:
             extra_body.update(additions)
+
+        # Per-provider reasoning lever (custom OpenAI-compat engines, incl. the
+        # generic CustomProfile used by vLLM/ollama/llama.cpp). Maps /reasoning
+        # (none/effort) onto the engine's native knobs. reasoning_control is only
+        # resolved for custom providers, so its presence is the gate. Applied
+        # before request_overrides so an explicit user override still wins.
+        _rc = params.get("reasoning_control")
+        if _rc:
+            _apply_custom_reasoning_control(extra_body, _rc, reasoning_config)
 
         # Request overrides (user config)
         overrides = params.get("request_overrides")

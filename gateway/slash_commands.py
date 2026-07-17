@@ -329,8 +329,146 @@ class GatewaySlashCommandsMixin:
             return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")
         return EphemeralReply(f"{header}{_tip_line}")
 
+    async def _handle_cd_command(self, event: MessageEvent, session_key: str) -> str:
+        """Handle /cd [path] — show or set THIS session's working directory.
+
+        The gateway is one process serving every topic and DM, and its own cwd
+        is wherever launchd started it. So "where am I" cannot be the process
+        cwd — it has to be per session, which is exactly what Hermes already
+        tracks: ``record_session_cwd`` is written after every terminal command,
+        and terminal/file/code tools all resolve through ``get_session_cwd``.
+
+        This writes the same record, so `/cd` and the agent's own `cd` are the
+        same state rather than two competing notions of where a topic is. In a
+        terminal you would just `cd` before launching; in a topic there is no
+        "before", which is why this exists.
+        """
+        import os
+
+        from tools.terminal_tool import get_session_cwd, record_session_cwd
+
+        raw = (event.get_command_args() or "").strip()
+        current = get_session_cwd(session_key)
+
+        if not raw:
+            return (
+                f"📂 `{current}`" if current else
+                "📂 This session has no working directory set yet — tools resolve "
+                "against the gateway's own cwd.\n\nSet one with `/cd <path>`."
+            )
+
+        path = os.path.abspath(os.path.expanduser(os.path.expandvars(raw)))
+        if not os.path.exists(path):
+            return f"❌ No such path: `{path}`"
+        if not os.path.isdir(path):
+            return f"❌ Not a directory: `{path}`"
+
+        record_session_cwd(session_key, path)
+        lines = [f"✅ `{current or '(unset)'}` → `{path}`"]
+
+        # If it's a repo, say so — that is what the orchestrator resolves.
+        try:
+            import subprocess
+
+            p = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True, timeout=10)
+            if p.returncode == 0 and p.stdout.strip():
+                top = p.stdout.strip().splitlines()[0]
+                b = subprocess.run(["git", "-C", path, "branch", "--show-current"],
+                                   capture_output=True, text=True, timeout=10)
+                lines.append(f"\n📦 git repo `{top}` on `{(b.stdout or '').strip() or 'detached'}`")
+        except Exception:
+            pass
+
+        lines.append(
+            "\nThis session only — other topics and DMs keep their own. "
+            "**Not persisted across a gateway restart** yet."
+        )
+        return "\n".join(lines)
+
     async def _handle_profile_command(self, event: MessageEvent) -> str:
-        """Handle /profile — show the profile serving this source and its home.
+        """Handle /profile [name] — show, or BIND, the profile serving this chat.
+
+        With an argument this binds the current scope (platform + chat_id +
+        thread_id, i.e. one Telegram topic) to that profile and persists it, so
+        the next message in the topic is served by it. That is the difference
+        between this and ``gateway.profile_routes``: the config route needs the
+        thread_id to exist before you can write it, and a restart to apply.
+        Opening a topic and saying what it is needs neither.
+
+        ``/profile default`` (or ``clear`` / ``off``) removes the binding.
+
+        Refuses loudly rather than binding something inert: without
+        ``gateway.multiplex_profiles`` the router never even looks at routes, so
+        a binding written here would be a lie the user only discovers by
+        noticing the wrong persona answering.
+        """
+        raw = (event.get_command_args() or "").strip()
+        if raw:
+            return await self._bind_profile_for_source(event, raw)
+        return await self._show_profile_for_source(event)
+
+    async def _bind_profile_for_source(self, event: MessageEvent, raw: str) -> str:
+        from gateway.profile_bindings import bind, unbind, get_binding
+
+        source = getattr(event, "source", None)
+        if source is None or not getattr(source, "platform", None):
+            return "❌ /profile <name> needs a chat to bind — no source on this event."
+
+        platform = source.platform.value
+        chat_id = getattr(source, "chat_id", None)
+        thread_id = getattr(source, "thread_id", None)
+        scope = f"{platform} chat {chat_id}" + (f" topic {thread_id}" if thread_id else "")
+
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return (
+                "❌ **Profile binding is off.** `gateway.multiplex_profiles` is not "
+                "enabled, so the router ignores every route and this binding would "
+                "do nothing at all.\n\nSet `gateway.multiplex_profiles: true` in "
+                "config.yaml and restart the gateway, then try again."
+            )
+
+        name = raw.split()[0].strip()
+        if name.lower() in {"default", "clear", "off", "none", "-"}:
+            had = unbind(platform, chat_id, thread_id)
+            return (
+                f"✅ Unbound — **{scope}** is served by `default` again."
+                if had else
+                f"Nothing to unbind: **{scope}** has no binding (it was already on `default`)."
+            )
+
+        try:
+            from hermes_cli.profiles import normalize_profile_name, profile_exists
+            canon = normalize_profile_name(name)
+        except Exception:
+            return f"❌ `{name}` is not a valid profile name."
+        if not profile_exists(canon):
+            try:
+                from hermes_cli.profiles import list_profiles
+                known = ", ".join(f"`{p}`" for p in list_profiles()) or "(none)"
+            except Exception:
+                known = "(could not list)"
+            return (
+                f"❌ No profile `{canon}` on this host. Binding it would route this "
+                f"topic at a profile that cannot answer.\n\nProfiles: {known}"
+            )
+
+        prev = get_binding(platform, chat_id, thread_id)
+        bind(platform, chat_id, thread_id, canon)
+        lines = [f"✅ **{scope}** → profile `{canon}`" + (f" (was `{prev}`)" if prev else "")]
+        if not thread_id:
+            lines.append(
+                "\n⚠️ This is the **whole chat**, not a topic — every topic here "
+                "without its own binding follows it. Bind inside a topic to scope it."
+            )
+        lines.append(
+            "\nTakes effect on your next message. This is a **new session** "
+            f"(`agent:{canon}:…`), so it starts with no scrollback from before."
+        )
+        return "\n".join(lines)
+
+    async def _show_profile_for_source(self, event: MessageEvent) -> str:
+        """Show the profile serving this source and its home.
 
         On a multiplexed gateway the process-level active profile is always
         the multiplexer's own (usually ``default``), so reporting it would

@@ -182,3 +182,67 @@ class TestGetCuteToolMessageFailureSuffix:
         # failure suffix.
         line = get_cute_tool_message("terminal", {"command": "ls"}, 0.2)
         assert "[" not in line.split("0.2s", 1)[1]
+
+
+class TestDetectToolFailureMCPDidError:
+    """MCP tools (e.g. XcodeBuildMCP) report status via an explicit `didError`
+    flag in `structuredContent`. A *successful* call still serializes a
+    required "error": null key — that must NOT be read as a failure. The false
+    positive fed the repeated_exact_failure guardrail and blocked healthy tools
+    (screenshot/snapshot_ui) mid-session."""
+
+    def _screenshot_success(self):
+        # Faithful shape of a successful XcodeBuildMCP screenshot result:
+        # human text + structuredContent carrying didError=False, error=None.
+        return json.dumps({
+            "result": "\n📷 Screenshot\n\n✅ Screenshot captured\n  Size: 368x800px\n",
+            "structuredContent": {
+                "schema": "xcodebuildmcp.output.capture-result",
+                "schemaVersion": "1",
+                "didError": False,
+                "error": None,
+                "data": {"summary": {"status": "SUCCEEDED"}},
+            },
+        })
+
+    def test_success_with_null_error_not_flagged(self):
+        # The regression: "error": null in structuredContent must be a success.
+        assert _detect_tool_failure(
+            "mcp_xcodebuildmcp_screenshot", self._screenshot_success()
+        ) == (False, "")
+
+    def test_success_via_cute_message_has_no_suffix(self):
+        line = get_cute_tool_message(
+            "mcp_xcodebuildmcp_screenshot", {}, 0.6, result=self._screenshot_success()
+        )
+        assert "[error]" not in line
+
+    def test_diderror_true_flagged_with_message(self):
+        fail = json.dumps({
+            "result": "\n📷 Screenshot\n\n❌ Simulator not booted\n",
+            "structuredContent": {
+                "schema": "xcodebuildmcp.output.capture-result",
+                "schemaVersion": "1",
+                "didError": True,
+                "error": "Simulator 295D is not booted",
+                "data": {},
+            },
+        })
+        is_failure, suffix = _detect_tool_failure("mcp_xcodebuildmcp_screenshot", fail)
+        assert is_failure is True
+        assert "not booted" in suffix
+
+    def test_diderror_true_without_message_generic_suffix(self):
+        fail = json.dumps({
+            "result": "boom",
+            "structuredContent": {
+                "schema": "x", "schemaVersion": "1",
+                "didError": True, "error": None, "data": {},
+            },
+        })
+        assert _detect_tool_failure("mcp_xcodebuildmcp_tap", fail) == (True, " [error]")
+
+    def test_top_level_diderror_also_honored(self):
+        # Some MCP servers surface didError at the top level, not nested.
+        ok = json.dumps({"didError": False, "error": None, "result": 'has "error" text'})
+        assert _detect_tool_failure("mcp_some_tool", ok) == (False, "")

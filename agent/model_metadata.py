@@ -2498,37 +2498,99 @@ def estimate_tokens_rough(text: str) -> int:
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
-    Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
-    image — the Anthropic pricing model — instead of counting raw base64
-    character length. Without this, a single ~1MB screenshot would be
-    estimated at ~250K tokens and trigger premature context compression.
+    Media parts are counted at their true (approximate) token cost instead
+    of raw base64 character length:
+
+    - images: flat ~1500 tokens each (the Anthropic pricing model). Without
+      this, a single ~1MB screenshot would be estimated at ~250K tokens and
+      trigger premature context compression.
+    - audio (``input_audio`` — native-audio /voice, #audio-routing): audio
+      encoders emit ~10-20 tokens/s, and base64 WAV @16kHz mono is ~42.7K
+      chars/s → ~2,800 b64 chars per real token. Counting the base64 as
+      text inflated every voice turn by ~65K phantom tokens and forced a
+      pointless compaction (which also busts the server prefix cache).
+    - video: flat ~4000 tokens per part (frame-sampled by the server).
     """
-    _IMAGE_TOKEN_COST = 1500
     total_chars = 0
-    image_tokens = 0
+    media_tokens = 0
     for msg in messages:
         total_chars += _estimate_message_chars(msg)
-        image_tokens += _count_image_tokens(msg, _IMAGE_TOKEN_COST)
-    return ((total_chars + 3) // 4) + image_tokens
+        media_tokens += _count_media_tokens(msg)
+    return ((total_chars + 3) // 4) + media_tokens
+
+
+_IMAGE_TOKEN_COST = 1500
+_VIDEO_TOKEN_COST = 4000
+_AUDIO_B64_CHARS_PER_TOKEN = 2800  # b64 WAV 16kHz mono ÷ ~15 encoder tok/s
+_AUDIO_MIN_TOKENS = 32
+_IMAGE_PART_TYPES = {"image", "image_url", "input_image"}
+_AUDIO_PART_TYPES = {"input_audio", "audio", "audio_url"}
+_VIDEO_PART_TYPES = {"video", "video_url", "input_video"}
+_MEDIA_PART_TYPES = _IMAGE_PART_TYPES | _AUDIO_PART_TYPES | _VIDEO_PART_TYPES
+
+
+def _audio_part_tokens(part: Dict[str, Any]) -> int:
+    """Duration-proportional estimate from the base64 payload length."""
+    data = ""
+    inner = part.get("input_audio")
+    if isinstance(inner, dict):
+        data = inner.get("data") or ""
+    if not data:
+        inner = part.get("audio_url")
+        if isinstance(inner, dict):
+            data = inner.get("url") or ""
+        elif isinstance(part.get("data"), str):
+            data = part["data"]
+    return max(_AUDIO_MIN_TOKENS, len(data) // _AUDIO_B64_CHARS_PER_TOKEN)
+
+
+def _media_part_tokens(part: Dict[str, Any]) -> int:
+    ptype = part.get("type")
+    if ptype in _IMAGE_PART_TYPES:
+        return _IMAGE_TOKEN_COST
+    if ptype in _AUDIO_PART_TYPES:
+        return _audio_part_tokens(part)
+    if ptype in _VIDEO_PART_TYPES:
+        return _VIDEO_TOKEN_COST
+    return 0
+
+
+def _count_media_tokens(msg: Dict[str, Any]) -> int:
+    """Token cost of all media content parts (image/audio/video) in a message."""
+    tokens = 0
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                tokens += _media_part_tokens(part)
+    stashed = msg.get("_anthropic_content_blocks") if isinstance(msg, dict) else None
+    if isinstance(stashed, list):
+        for part in stashed:
+            if isinstance(part, dict) and part.get("type") == "image":
+                tokens += _IMAGE_TOKEN_COST
+    # Multimodal tool results that haven't been converted yet.
+    if isinstance(content, dict) and content.get("_multimodal"):
+        inner = content.get("content")
+        if isinstance(inner, list):
+            for part in inner:
+                if isinstance(part, dict):
+                    tokens += _media_part_tokens(part)
+    return tokens
 
 
 def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
-    """Count image-like content parts in a message; return their token cost."""
+    """Back-compat shim — image-only count (see _count_media_tokens)."""
     count = 0
     content = msg.get("content") if isinstance(msg, dict) else None
     if isinstance(content, list):
         for part in content:
-            if not isinstance(part, dict):
-                continue
-            ptype = part.get("type")
-            if ptype in {"image", "image_url", "input_image"}:
+            if isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES:
                 count += 1
     stashed = msg.get("_anthropic_content_blocks") if isinstance(msg, dict) else None
     if isinstance(stashed, list):
         for part in stashed:
             if isinstance(part, dict) and part.get("type") == "image":
                 count += 1
-    # Multimodal tool results that haven't been converted yet.
     if isinstance(content, dict) and content.get("_multimodal"):
         inner = content.get("content")
         if isinstance(inner, list):
@@ -2539,10 +2601,12 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
 
 
 def _estimate_message_chars(msg: Dict[str, Any]) -> int:
-    """Char count for token estimation, excluding base64 image data.
+    """Char count for token estimation, excluding base64 media data.
 
-    Base64 images are counted via `_count_image_tokens` instead; including
-    their raw chars here would massively overestimate token usage.
+    Base64 media (images, ``input_audio`` voice clips, video) is counted
+    via `_count_media_tokens` instead; including the raw chars here would
+    massively overestimate token usage (a 30s voice WAV is ~1.3M b64 chars
+    ≈ 325K phantom tokens, vs ~450 real audio tokens).
     """
     if not isinstance(msg, dict):
         return len(str(msg))
@@ -2555,8 +2619,8 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
                 cleaned = []
                 for part in v:
                     if isinstance(part, dict):
-                        if part.get("type") in {"image", "image_url", "input_image"}:
-                            cleaned.append({"type": part.get("type"), "image": "[stripped]"})
+                        if part.get("type") in _MEDIA_PART_TYPES:
+                            cleaned.append({"type": part.get("type"), "media": "[stripped]"})
                         else:
                             cleaned.append(part)
                     else:

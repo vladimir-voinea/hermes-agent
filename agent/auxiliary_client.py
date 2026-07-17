@@ -3477,6 +3477,19 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     return False
 
 
+# Auxiliary tasks that are handled through the vision client path (native
+# image support, vision provider resolution/fallback, image-size retry). Each
+# still reads its own ``auxiliary.<task>`` config block for the endpoint/model,
+# so ``inspect_ui`` (GUI-grounding on Holo) is routed independently of the
+# general ``vision`` task while sharing the same vision-aware plumbing.
+_VISION_TASKS = frozenset({"vision", "inspect_ui"})
+
+
+def _is_vision_task(task: Optional[str]) -> bool:
+    """True when ``task`` should use the vision client path (see _VISION_TASKS)."""
+    return task in _VISION_TASKS
+
+
 def _retry_same_provider_sync(
     *,
     task: Optional[str],
@@ -3495,7 +3508,7 @@ def _retry_same_provider_sync(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
 ) -> Any:
-    if task == "vision":
+    if _is_vision_task(task):
         _, retry_client, retry_model = resolve_vision_provider_client(
             provider=resolved_provider,
             model=final_model,
@@ -3554,7 +3567,7 @@ async def _retry_same_provider_async(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
 ) -> Any:
-    if task == "vision":
+    if _is_vision_task(task):
         _, retry_client, retry_model = resolve_vision_provider_client(
             provider=resolved_provider,
             model=final_model,
@@ -6825,7 +6838,7 @@ def call_llm(
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
-    if task == "vision":
+    if _is_vision_task(task):
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
@@ -7059,7 +7072,7 @@ def call_llm(
         )
         if _is_model_not_found_error(first_err) and _heal_is_nous:
             healed_model = _refresh_nous_recommended_model(
-                vision=(task == "vision"), stale_model=kwargs.get("model"))
+                vision=_is_vision_task(task), stale_model=kwargs.get("model"))
             if healed_model and healed_model != kwargs.get("model"):
                 logger.warning(
                     "Auxiliary %s: model %r no longer in Nous catalog; "
@@ -7091,7 +7104,7 @@ def call_llm(
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
                 main_runtime=main_runtime,
-                is_vision=(task == "vision"),
+                is_vision=_is_vision_task(task),
             )
             if refreshed_client is not None:
                 logger.info(
@@ -7122,7 +7135,7 @@ def call_llm(
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
                 main_runtime=main_runtime,
-                is_vision=(task == "vision"),
+                is_vision=_is_vision_task(task),
             )
             if refreshed_client is not None:
                 logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
@@ -7449,7 +7462,7 @@ async def async_call_llm(
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
-    if task == "vision":
+    if _is_vision_task(task):
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
@@ -7490,7 +7503,7 @@ async def async_call_llm(
                 )
                 if fb_client is not None:
                     client, final_model = _to_async_client(
-                        fb_client, fb_model or "", is_vision=(task == "vision")
+                        fb_client, fb_model or "", is_vision=_is_vision_task(task)
                     )
                     resolved_provider = fb_label or resolved_provider
                 else:
@@ -7616,7 +7629,7 @@ async def async_call_llm(
         )
         if _is_model_not_found_error(first_err) and _heal_is_nous:
             healed_model = _refresh_nous_recommended_model(
-                vision=(task == "vision"), stale_model=kwargs.get("model"))
+                vision=_is_vision_task(task), stale_model=kwargs.get("model"))
             if healed_model and healed_model != kwargs.get("model"):
                 logger.warning(
                     "Auxiliary %s (async): model %r no longer in Nous catalog; "
@@ -7647,7 +7660,7 @@ async def async_call_llm(
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
-                is_vision=(task == "vision"),
+                is_vision=_is_vision_task(task),
             )
             if refreshed_client is not None:
                 logger.info(
@@ -7677,7 +7690,7 @@ async def async_call_llm(
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
-                is_vision=(task == "vision"),
+                is_vision=_is_vision_task(task),
             )
             if refreshed_client is not None:
                 logger.info("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",
@@ -7836,7 +7849,7 @@ async def async_call_llm(
             if fb_client is not None:
                 # Convert sync fallback client to async
                 async_fb, async_fb_model = _to_async_client(
-                    fb_client, fb_model or "", is_vision=(task == "vision")
+                    fb_client, fb_model or "", is_vision=_is_vision_task(task)
                 )
                 fb_resp = await _call_fallback_candidate_async(
                     async_fb, async_fb_model or fb_model, fb_label,
@@ -7853,7 +7866,7 @@ async def async_call_llm(
                     resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
                     async_fb, async_fb_model = _to_async_client(
-                        fb_client, fb_model or "", is_vision=(task == "vision")
+                        fb_client, fb_model or "", is_vision=_is_vision_task(task)
                     )
                     fb_resp = await _call_fallback_candidate_async(
                         async_fb, async_fb_model or fb_model, fb_label,

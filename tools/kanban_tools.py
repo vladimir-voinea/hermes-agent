@@ -353,6 +353,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "worker_runtime": task.worker_runtime,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -398,6 +399,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "worker_runtime": t.worker_runtime,
                 }
 
             def _run_dict(r):
@@ -1066,11 +1068,22 @@ def _handle_create(args: dict, **kw) -> str:
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
+    # Resolve the worker runtime up front: it drives whether an assignee
+    # is required (Hermes cards need a profile; external runtimes may
+    # omit it) and which Hermes-only flags are rejected.
+    from hermes_cli import kanban_worker_runtimes as _runtimes
+    worker_runtime = args.get("worker_runtime")
+    try:
+        runtime_id = _runtimes.validate_runtime(worker_runtime)
+    except ValueError as exc:
+        return tool_error(f"kanban_create: {exc}")
     assignee = args.get("assignee")
-    if not assignee:
+    if not assignee and _runtimes.requires_assignee(runtime_id):
         return tool_error(
-            "assignee is required — name the profile that should execute this "
-            "task (the dispatcher will only spawn tasks with an assignee)"
+            "assignee is required for the 'hermes' worker runtime — name the "
+            "profile that should execute this task (the dispatcher only "
+            "spawns hermes-runtime tasks with an assignee). For an external "
+            "runtime pass worker_runtime='opencode' to omit the assignee."
         )
     body = args.get("body")
     parents = args.get("parents") or []
@@ -1138,7 +1151,7 @@ def _handle_create(args: dict, **kw) -> str:
                 conn,
                 title=str(title).strip(),
                 body=body,
-                assignee=str(assignee),
+                assignee=str(assignee) if assignee is not None else None,
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
@@ -1159,12 +1172,14 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                worker_runtime=runtime_id,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                worker_runtime=runtime_id,
                 subscribed=subscribed,
             )
         finally:
@@ -1732,9 +1747,12 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Profile name that should execute this task "
-                    "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                    "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "(e.g. 'researcher-a', 'reviewer', 'writer'). Required "
+                    "for the default 'hermes' worker runtime — tasks without "
+                    "an assignee are never dispatched. May be omitted when "
+                    "worker_runtime is an external runtime (e.g. 'opencode'), "
+                    "in which case the card is owned by that runtime and "
+                    "displayed with the runtime id as its assignee."
                 ),
             },
             "body": {
@@ -1865,9 +1883,23 @@ KANBAN_CREATE_SCHEMA = {
                     "true. Defaults to the goal-engine default (20)."
                 ),
             },
+            "worker_runtime": {
+                "type": "string",
+                "description": (
+                    "Worker runtime that owns this card's attempts. Defaults "
+                    "to 'hermes' (a Hermes profile worker spawned via "
+                    "`hermes -p <assignee>`). Set to an external runtime id "
+                    "such as 'opencode' to spawn a lifecycle bridge that "
+                    "runs the external agent headlessly and writes board "
+                    "state back through this kernel. Unknown or disabled "
+                    "runtimes are rejected with a clear error. goal_mode and "
+                    "skills are Hermes-only and are rejected for external "
+                    "runtimes."
+                ),
+            },
             "board": _board_schema_prop(),
         },
-        "required": ["title", "assignee"],
+        "required": ["title"],
     },
 }
 

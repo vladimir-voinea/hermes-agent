@@ -214,6 +214,20 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
 
+    # Honor an explicit MCP `didError` flag before the substring heuristic —
+    # a successful MCP call (XcodeBuildMCP etc.) still serializes "error": null,
+    # which would otherwise read as a failure and drive the repeated-failure
+    # block. Mirrors agent.display._detect_tool_failure.
+    data = safe_json_loads(result)
+    if isinstance(data, dict):
+        structured = data.get("structuredContent")
+        scope = structured if isinstance(structured, dict) else data
+        if "didError" in scope:
+            if scope.get("didError"):
+                err = scope.get("error")
+                return True, f" [{str(err).strip()[:80]}]" if err else " [error]"
+            return False, ""
+
     lower = result[:500].lower()
     if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
         return True, " [error]"

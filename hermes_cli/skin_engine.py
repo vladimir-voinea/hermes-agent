@@ -113,6 +113,7 @@ Activate with ``/skin <name>`` in the CLI or ``display.skin: <name>`` in config.
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -195,6 +196,50 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
             "help_header": "(^_^)? Available Commands",
         },
         "tool_prefix": "┊",
+    },
+    "opencode": {
+        "name": "opencode",
+        "description": "Flat, borderless, opencode-quiet — neutral slate + one cool accent (--repl2)",
+        "colors": {
+            "banner_border": "#2a2e3a",
+            "banner_title": "#c0caf5",
+            "banner_accent": "#7aa2f7",
+            "banner_dim": "#6b7089",
+            "banner_text": "#a9b1d6",
+            "ui_accent": "#7aa2f7",
+            "ui_primary": "#c0caf5",
+            "ui_label": "#9aa5ce",
+            "ui_ok": "#9ece6a",
+            "ui_error": "#f7768e",
+            "ui_warn": "#e0af68",
+            "prompt": "#7aa2f7",
+            "input_rule": "#2a2e3a",
+            "response_border": "#2a2e3a",
+            "completion_menu_bg": "#16161e",
+            "completion_menu_current_bg": "#283457",
+            "completion_menu_meta_bg": "#16161e",
+            "completion_menu_meta_current_bg": "#283457",
+            "status_bar_bg": "#16161e",
+            "status_bar_text": "#787c99",
+            "status_bar_strong": "#c0caf5",
+            "status_bar_dim": "#3b3f52",
+            "status_bar_good": "#9ece6a",
+            "status_bar_warn": "#e0af68",
+            "status_bar_bad": "#ff9e64",
+            "status_bar_critical": "#f7768e",
+            "session_label": "#565f89",
+            "session_border": "#2a2e3a",
+        },
+        "spinner": {},
+        "branding": {
+            "agent_name": "Hermes",
+            "welcome": "Type your message or /help for commands.",
+            "goodbye": "Goodbye",
+            "response_label": " hermes ",
+            "prompt_symbol": "❯",
+            "help_header": "Commands",
+        },
+        "tool_prefix": "›",
     },
     "ares": {
         "name": "ares",
@@ -767,9 +812,16 @@ def load_skin(name: str) -> SkinConfig:
 
 
 def get_active_skin() -> SkinConfig:
-    """Get the currently active skin config (cached)."""
-    global _active_skin
+    """Get the currently active skin config (cached).
+
+    --repl2 sets HERMES_REPL_VARIANT=2 to force the flat opencode skin,
+    overriding whatever skin the config selects. The env is only set by the
+    v2 launcher, so the classic REPL is unaffected.
+    """
+    global _active_skin, _active_skin_name
     if _active_skin is None:
+        if os.environ.get("HERMES_REPL_VARIANT") == "2":
+            _active_skin_name = "opencode"
         _active_skin = load_skin(_active_skin_name)
     return _active_skin
 

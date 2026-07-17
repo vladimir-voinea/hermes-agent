@@ -992,10 +992,18 @@ class KawaiiSpinner:
         "٩(๑❛ᴗ❛๑)۶", "(⊙_⊙)", "(¬_¬)", "( ͡° ͜ʖ ͡°)", "ಠ_ಠ",
     ]
 
+    # THINKING_VERBS = [
+    #     "pondering", "contemplating", "musing", "cogitating", "ruminating",
+    #     "deliberating", "mulling", "reflecting", "processing", "reasoning",
+    #     "analyzing", "computing", "synthesizing", "formulating", "brainstorming",
+    # ]
+    # Note: the "…" is appended by the renderer (f"{face} {verb}..."), so verbs
+    # are stored bare here to avoid a doubled ellipsis.
     THINKING_VERBS = [
-        "pondering", "contemplating", "musing", "cogitating", "ruminating",
-        "deliberating", "mulling", "reflecting", "processing", "reasoning",
-        "analyzing", "computing", "synthesizing", "formulating", "brainstorming",
+        "marinating", "percolating", "noodling", "ruminating", "ideating",
+        "contemplating", "fermenting", "simmering", "wrangling", "puttering",
+        "divining", "spelunking", "doodling", "meandering", "tinkering",
+        "conjuring", "marveling", "loitering", "untangling", "bamboozling",
     ]
 
     @classmethod
@@ -1249,6 +1257,22 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         if isinstance(data, dict):
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
+
+    # MCP tools (XcodeBuildMCP etc.) report success/failure via an explicit
+    # `didError` flag — usually inside `structuredContent`, sometimes top level
+    # (see tools/mcp_tool.py, which folds structuredContent into the result).
+    # A *successful* MCP call still serializes a required "error": null key,
+    # which the generic substring scan below would misread as a failure. That
+    # false positive fed the repeated_exact_failure guardrail and blocked
+    # healthy tools (e.g. screenshot) mid-session — so trust the flag first.
+    if isinstance(data, dict):
+        structured = data.get("structuredContent")
+        scope = structured if isinstance(structured, dict) else data
+        if "didError" in scope:
+            if scope.get("didError"):
+                err = scope.get("error")
+                return True, f" [{_trim_error(str(err))}]" if err else " [error]"
+            return False, ""
 
     # Structured error in JSON result (any tool that surfaces {"error": ...}).
     if isinstance(data, dict):

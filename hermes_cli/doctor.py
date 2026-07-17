@@ -510,6 +510,743 @@ def managed_scope_check() -> None:
         check_info(f"managed dir set via HERMES_MANAGED_DIR={managed_dir}")
 
 
+# ---------------------------------------------------------------------------
+# Profile shape / silent drift
+#
+# Hermes profiles do NOT inherit config: each profile's config.yaml is
+# deep-merged onto the code DEFAULT_CONFIG, never onto the root profile's
+# config.yaml. Every failure mode this section checks is *silent* at runtime —
+# nothing errors, the thing just quietly doesn't happen (a plugin's tools
+# vanish from the schema, a guard hook never fires, a /goal judge gate does
+# nothing). The checks below flag *internal inconsistency* inside one profile
+# (references something it doesn't define / declares something that cannot
+# work), never mere *difference* from the root — profiles are supposed to
+# differ.
+# ---------------------------------------------------------------------------
+
+import re as _psre
+import shlex as _psshlex
+
+# Interpreter basenames for the ``<interpreter> <script>`` hook-command form:
+# the script needs to exist but not be executable.
+_HOOK_INTERPRETER_BASENAMES = {
+    "python", "python3", "bash", "sh", "zsh", "dash", "node", "deno",
+    "ruby", "perl", "uv", "npx",
+}
+
+# Literal ``toolset="..."`` keyword arguments in plugin source. Plugins
+# register tools via ``ctx.register_tool(..., toolset="<name>")``; the
+# manifest does not carry the toolset, so a static source scan is the only
+# offline way to learn where a plugin's tools land.
+_TOOLSET_KWARG_RE = _psre.compile(r"""toolset\s*=\s*["']([A-Za-z0-9_:.\-]+)["']""")
+
+_OFFLINE_PROVIDER_IDS_CACHE: set | None | str = "unset"
+
+
+def _offline_builtin_provider_ids() -> set | None:
+    """Provider ids resolvable WITHOUT a profile defining them, offline only.
+
+    Union of every catalog source that does not require network:
+    auth PROVIDER_REGISTRY, the providers-catalog overlays + aliases, the
+    pluggable providers package, and the models.dev *disk cache* (never the
+    network fetch — doctor must stay offline-fast). Returns None when every
+    source failed, so callers can report the check as not-run instead of
+    emitting false positives.
+    """
+    global _OFFLINE_PROVIDER_IDS_CACHE
+    if _OFFLINE_PROVIDER_IDS_CACHE != "unset":
+        return _OFFLINE_PROVIDER_IDS_CACHE
+
+    ids: set = set()
+    any_source_ok = False
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        ids.update(str(k).lower() for k in PROVIDER_REGISTRY)
+        any_source_ok = True
+    except Exception:
+        pass
+    try:
+        from hermes_cli.providers import ALIASES, HERMES_OVERLAYS
+        ids.update(str(k).lower() for k in ALIASES)
+        ids.update(str(v).lower() for v in ALIASES.values())
+        ids.update(str(k).lower() for k in HERMES_OVERLAYS)
+        any_source_ok = True
+    except Exception:
+        pass
+    try:
+        from providers import list_providers
+        for pp in list_providers():
+            name = getattr(pp, "name", "")
+            if name:
+                ids.add(str(name).lower())
+            for alias in getattr(pp, "aliases", ()) or ():
+                ids.add(str(alias).lower())
+        any_source_ok = True
+    except Exception:
+        pass
+    try:
+        # Disk cache ONLY — fetch_models_dev() may hit the network on a cold
+        # cache, which an interactive doctor must never do.
+        from agent.models_dev import PROVIDER_TO_MODELS_DEV, _load_disk_cache
+        ids.update(str(k).lower() for k in PROVIDER_TO_MODELS_DEV)
+        ids.update(str(k).lower() for k in (_load_disk_cache() or {}))
+        # (no any_source_ok: an empty cache is normal, not a working source)
+    except Exception:
+        pass
+
+    ids.update({"auto", "custom", "openrouter"})
+    _OFFLINE_PROVIDER_IDS_CACHE = ids if any_source_ok else None
+    return _OFFLINE_PROVIDER_IDS_CACHE
+
+
+def _custom_provider_slugs(cfg: dict) -> set:
+    """Slugs of ``custom_providers`` entries defined in this config."""
+    slugs: set = set()
+    entries = cfg.get("custom_providers")
+    if not isinstance(entries, list):
+        return slugs
+    try:
+        from hermes_cli.providers import custom_provider_slug
+    except Exception:
+        def custom_provider_slug(display_name: str) -> str:
+            return "custom:" + display_name.strip().lower().replace(" ", "-")
+    for entry in entries:
+        if isinstance(entry, dict):
+            name = str(entry.get("name") or "").strip()
+            if name:
+                slug = custom_provider_slug(name)  # "custom:<normalized-name>"
+                slugs.add(slug)
+                slugs.add(slug.split(":", 1)[1])  # bare form too
+    return slugs
+
+
+def _profile_defined_provider_ids(cfg: dict) -> set:
+    """Provider names this profile itself defines (``providers:`` dict).
+
+    Both the dict key and each entry's ``name:`` display field count — the
+    runtime resolver (hermes_cli.runtime_provider._get_named_custom_provider)
+    matches either, with or without a ``custom:`` prefix.
+    """
+    defined: set = set()
+    user_providers = cfg.get("providers")
+    if isinstance(user_providers, dict):
+        for key, entry in user_providers.items():
+            if str(key).strip():
+                defined.add(str(key).strip().lower())
+            if isinstance(entry, dict):
+                display = str(entry.get("name") or "").strip()
+                if display:
+                    defined.add(display.lower().replace(" ", "-"))
+    return defined
+
+
+def _provider_reference_problem(
+    raw_provider: str,
+    cfg: dict,
+    builtin_ids: set,
+    *,
+    extra_ok: set = frozenset(),
+) -> bool:
+    """True when ``raw_provider`` resolves to nothing this profile can use."""
+    provider = str(raw_provider or "").strip().lower()
+    if not provider or provider in {"auto", "custom"} or provider in extra_ok:
+        return False
+    slugs = _custom_provider_slugs(cfg)
+    defined = _profile_defined_provider_ids(cfg)
+    if provider.startswith("custom:"):
+        # ``custom:<name>`` resolves against BOTH the legacy custom_providers
+        # list and the providers: dict (runtime_provider matches either).
+        suffix = provider.split(":", 1)[1].strip()
+        return provider not in slugs and suffix not in slugs and suffix not in defined
+    if provider in slugs or provider in defined:
+        return False
+    return provider not in builtin_ids
+
+
+def _hook_command_problem(command: str) -> str | None:
+    """Return why ``command`` cannot execute, or None when it looks runnable.
+
+    Mirrors the runtime path (``agent.shell_hooks._spawn``): expanduser →
+    shlex.split → subprocess without a shell. A command that fails any of
+    these never fires — and Hermes hooks FAIL OPEN, so the guard is
+    silently gone.
+    """
+    try:
+        argv = _psshlex.split(os.path.expanduser(str(command)))
+    except ValueError as exc:
+        return f"command cannot be parsed: {exc}"
+    if not argv:
+        return "command is empty"
+
+    head = argv[0]
+    problem = _executable_problem(head)
+    if problem:
+        return problem
+
+    # ``<interpreter> <script>`` form: the script must exist (need not be +x).
+    base = os.path.basename(head)
+    if base in _HOOK_INTERPRETER_BASENAMES or base.startswith("python3."):
+        script = next((a for a in argv[1:] if not a.startswith("-")), None)
+        if script and os.sep in script:
+            spath = Path(script)
+            if spath.is_symlink() and not spath.exists():
+                return f"script {script} is a dangling symlink → {_readlink_safe(spath)}"
+            if not spath.exists():
+                return f"script {script} does not exist"
+    return None
+
+
+def _executable_problem(head: str) -> str | None:
+    """Why argv[0] can't launch: missing, dangling, not executable, not on PATH."""
+    if os.sep in head:
+        p = Path(head)
+        if p.is_symlink() and not p.exists():
+            return f"{head} is a dangling symlink → {_readlink_safe(p)}"
+        if not p.exists():
+            return f"{head} does not exist"
+        if p.is_file() and not os.access(head, os.X_OK):
+            return f"{head} is not executable (chmod +x)"
+        return None
+    if _safe_which(head) is None:
+        return f"'{head}' not found on PATH"
+    return None
+
+
+def _readlink_safe(p: Path) -> str:
+    try:
+        return os.readlink(str(p))
+    except OSError:
+        return "?"
+
+
+def _scan_plugins_tree(plugins_dir: Path) -> tuple[dict, dict, list]:
+    """Statically index a plugins directory the way the plugin scanner would.
+
+    Returns ``(index, flat_dir_names, errors)``:
+      - index: plugin key → {"dir": Path, "kind": str}. For flat plugins the
+        key is the manifest ``name`` (falling back to the directory name when
+        the manifest has no name); for nested category plugins the key is
+        ``<parent>/<dirname>`` — matching hermes_cli.plugins._parse_manifest.
+      - flat_dir_names: directory name → manifest name, for flat plugins whose
+        manifest name differs from the directory (an enabled entry using the
+        directory name will silently never match).
+      - errors: human-readable manifest parse failures.
+    """
+    index: dict = {}
+    flat_dir_names: dict = {}
+    errors: list = []
+    if not plugins_dir.is_dir():
+        return index, flat_dir_names, errors
+    try:
+        import yaml as _yaml
+    except Exception:
+        return index, flat_dir_names, ["PyYAML unavailable — plugin manifests not readable"]
+
+    def _read_manifest(manifest_path: Path) -> dict | None:
+        try:
+            data = _yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            errors.append(f"{manifest_path.parent.name}/plugin.yaml is unreadable ({exc}) — plugin cannot load")
+            return None
+
+    try:
+        children = sorted(plugins_dir.iterdir())
+    except OSError as exc:
+        return index, flat_dir_names, [f"plugins directory unreadable ({exc})"]
+
+    for child in children:
+        if not child.is_dir():  # follows symlinks — a symlinked plugin dir counts
+            continue
+        manifest = child / "plugin.yaml"
+        if manifest.is_file():
+            data = _read_manifest(manifest)
+            if data is None:
+                continue
+            name = str(data.get("name") or child.name)
+            kind = str(data.get("kind") or "standalone").strip().lower()
+            index[name] = {"dir": child, "kind": kind}
+            if name != child.name:
+                flat_dir_names[child.name] = name
+            continue
+        # Nested category plugins: plugins/<category>/<provider>/plugin.yaml
+        try:
+            grandchildren = sorted(child.iterdir())
+        except OSError:
+            continue
+        for gc in grandchildren:
+            if gc.is_dir() and (gc / "plugin.yaml").is_file():
+                data = _read_manifest(gc / "plugin.yaml")
+                if data is None:
+                    continue
+                kind = str(data.get("kind") or "standalone").strip().lower()
+                index[f"{child.name}/{gc.name}"] = {"dir": gc, "kind": kind}
+    return index, flat_dir_names, errors
+
+
+def _plugin_toolset_literals(plugin_dir: Path, max_files: int = 80) -> set:
+    """Toolset names a plugin's source registers tools under (static scan).
+
+    Best-effort: finds literal ``toolset="..."`` keyword args. Returns an
+    empty set when nothing is found — callers must treat that as
+    "unverifiable", never as "verified fine".
+    """
+    found: set = set()
+    seen_dirs: set = set()
+    count = 0
+    for root, dirs, files in os.walk(plugin_dir, followlinks=True):
+        real = os.path.realpath(root)
+        if real in seen_dirs:
+            dirs[:] = []
+            continue
+        seen_dirs.add(real)
+        dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "node_modules", "tests", ".venv", "venv")]
+        for fname in files:
+            if not fname.endswith(".py"):
+                continue
+            count += 1
+            if count > max_files:
+                return found
+            try:
+                text = (Path(root) / fname).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            found.update(_TOOLSET_KWARG_RE.findall(text))
+    return found
+
+
+def _dangling_symlinks_under(root: Path, limit: int = 200) -> list:
+    """``(relative_path, target)`` for every dangling symlink under root."""
+    out: list = []
+    if not root.is_dir():
+        return out
+    for droot, dirs, files in os.walk(root, followlinks=False):
+        for name in list(dirs) + list(files):
+            p = Path(droot) / name
+            try:
+                if p.is_symlink() and not p.exists():
+                    out.append((str(p.relative_to(root)), _readlink_safe(p)))
+                    if len(out) >= limit:
+                        return out
+            except OSError:
+                continue
+    return out
+
+
+def _entrypoint_plugin_names() -> set:
+    """Names of pip-installed (entry-point) plugins — cheap, offline."""
+    try:
+        import importlib.metadata as _md
+        from hermes_cli.plugins import ENTRY_POINTS_GROUP
+        eps = _md.entry_points()
+        if hasattr(eps, "select"):
+            group = eps.select(group=ENTRY_POINTS_GROUP)
+        elif isinstance(eps, dict):
+            group = eps.get(ENTRY_POINTS_GROUP, [])
+        else:
+            group = [ep for ep in eps if ep.group == ENTRY_POINTS_GROUP]
+        return {ep.name for ep in group}
+    except Exception:
+        return set()
+
+
+def _profile_operative_toolsets(cfg: dict) -> set | None:
+    """The union of every toolset allow-list the profile declares.
+
+    Returns None when the profile declares no allow-list at all (defaults
+    apply — nothing to check against). ``toolsets:`` and each
+    ``platform_toolsets.<platform>`` list all count: a plugin toolset absent
+    from every one of them can never reach a model.
+    """
+    operative: set = set()
+    declared = False
+    toolsets_list = cfg.get("toolsets")
+    if isinstance(toolsets_list, list) and toolsets_list:
+        declared = True
+        operative.update(str(t) for t in toolsets_list if isinstance(t, str))
+    platform_toolsets = cfg.get("platform_toolsets")
+    if isinstance(platform_toolsets, dict):
+        for entries in platform_toolsets.values():
+            if isinstance(entries, list) and entries:
+                declared = True
+                operative.update(str(t) for t in entries if isinstance(t, str))
+    return operative if declared else None
+
+
+def _profile_shape_findings(
+    profile_dir: Path,
+    *,
+    bundled_plugins_root: Path | None = None,
+    builtin_provider_ids: set | None = None,
+    max_hook_timeout: int | None = None,
+    valid_hook_events: set | None = None,
+) -> list:
+    """All silent-drift findings for one profile directory.
+
+    Returns ``[(severity, text, detail), ...]`` with severity ``"fail"`` or
+    ``"warn"``. Read-only; never raises for a malformed profile (a broken
+    config is itself a finding).
+    """
+    findings: list = []
+
+    def fail(text: str, detail: str = "") -> None:
+        findings.append(("fail", text, detail))
+
+    def warn(text: str, detail: str = "") -> None:
+        findings.append(("warn", text, detail))
+
+    # ── config load ──────────────────────────────────────────────────────
+    cfg: dict = {}
+    config_path = profile_dir / "config.yaml"
+    if config_path.exists():
+        try:
+            import yaml as _yaml
+            raw = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            if raw is None:
+                raw = {}
+            if not isinstance(raw, dict):
+                fail(
+                    "config.yaml is not a mapping",
+                    "(profile runs on pure code defaults — every customization silently gone)",
+                )
+                raw = {}
+            cfg = raw
+        except Exception as exc:
+            fail(
+                "config.yaml is unreadable/malformed",
+                f"({exc}) — profile runs on pure code defaults; every customization silently gone",
+            )
+            cfg = {}
+    # A named profile without config.yaml is already flagged by the Profiles
+    # section above; shape checks that need config simply have nothing to say.
+
+    # ── plugins.enabled: presence + toolset allow-list coverage ─────────
+    plugins_cfg = cfg.get("plugins")
+    enabled_plugins: list = []
+    if isinstance(plugins_cfg, dict) and isinstance(plugins_cfg.get("enabled"), list):
+        enabled_plugins = [str(e) for e in plugins_cfg["enabled"] if isinstance(e, str) and e.strip()]
+
+    profile_index, profile_dir_names, manifest_errors = _scan_plugins_tree(profile_dir / "plugins")
+    bundled_index: dict = {}
+    bundled_dir_names: dict = {}
+    if bundled_plugins_root is not None:
+        bundled_index, bundled_dir_names, _ = _scan_plugins_tree(bundled_plugins_root)
+    for err in manifest_errors:
+        fail(f"plugins/{err}")
+
+    operative_toolsets = _profile_operative_toolsets(cfg)
+    entrypoint_names = None  # resolved lazily, only if an enabled plugin is missing
+    enabled_plugin_toolset_literals: set = set()
+
+    for key in enabled_plugins:
+        entry = profile_index.get(key) or bundled_index.get(key)
+        if entry is None:
+            # Directory-name-vs-manifest-name mismatch: the exact trap the
+            # scanner documents (manifest ``name:`` IS the key; dir name ignored).
+            mismatch = profile_dir_names.get(key) or bundled_dir_names.get(key)
+            if mismatch:
+                fail(
+                    f"plugins.enabled '{key}' matches a plugin DIRECTORY but its "
+                    f"plugin.yaml says name: '{mismatch}'",
+                    "(the manifest name is the key — the plugin silently never loads)",
+                )
+                continue
+            if entrypoint_names is None:
+                entrypoint_names = _entrypoint_plugin_names()
+            if key in entrypoint_names:
+                continue  # pip-installed plugin; presence verified
+            fail(
+                f"plugins.enabled '{key}' not found in this profile's plugins/ "
+                f"or the bundled plugins",
+                "(the plugin silently never loads — its tools and hooks are all absent)",
+            )
+            continue
+
+        # Present. Where do its tools land, and does the allow-list let them in?
+        if entry["kind"] not in ("standalone",):
+            continue  # platform/backend/exclusive plugins load differently
+        literals = _plugin_toolset_literals(entry["dir"])
+        enabled_plugin_toolset_literals.update(literals)
+        if operative_toolsets is not None and literals:
+            for ts in sorted(literals - operative_toolsets):
+                warn(
+                    f"plugin '{key}' registers tools under toolset '{ts}' but no "
+                    f"toolsets/platform_toolsets allow-list includes it",
+                    "(the plugin loads, yet its tools are silently absent from the model's schema)",
+                )
+        # If no literal toolset was found the registration is dynamic and this
+        # static check cannot verify it — stay silent rather than fake a pass/fail.
+
+    # ── hooks: fail-open guard scripts + timeout ceiling ─────────────────
+    hooks_cfg = cfg.get("hooks")
+    if hooks_cfg is not None and not isinstance(hooks_cfg, dict):
+        fail("hooks: is not a mapping", "(ALL hooks are ignored — every guard silently off)")
+    elif isinstance(hooks_cfg, dict):
+        for event, entries in hooks_cfg.items():
+            if event == "output_spill":  # reserved config sub-section, not an event
+                continue
+            if valid_hook_events is not None and event not in valid_hook_events:
+                import difflib as _difflib
+                suggestion = _difflib.get_close_matches(str(event), sorted(valid_hook_events), n=1, cutoff=0.6)
+                hint = f" — did you mean '{suggestion[0]}'?" if suggestion else ""
+                fail(
+                    f"hooks.{event} is not a valid hook event{hint}",
+                    "(every hook under it silently never fires)",
+                )
+                continue
+            if entries is None:
+                continue
+            if not isinstance(entries, list):
+                fail(f"hooks.{event} is not a list", "(all hooks under it are ignored — guards silently off)")
+                continue
+            for i, raw in enumerate(entries):
+                label = f"hooks.{event}[{i}]"
+                if not isinstance(raw, dict):
+                    fail(f"{label} is not a mapping", "(entry ignored — guard silently off)")
+                    continue
+                command = raw.get("command")
+                if not isinstance(command, str) or not command.strip():
+                    fail(f"{label} has no command", "(entry ignored — guard silently off)")
+                    continue
+                problem = _hook_command_problem(command)
+                if problem:
+                    fail(
+                        f"{label}: {problem}",
+                        "(hook never fires and hooks FAIL OPEN — this guard is silently gone)",
+                    )
+                timeout_raw = raw.get("timeout")
+                if max_hook_timeout is not None and timeout_raw is not None:
+                    try:
+                        timeout_val = int(timeout_raw)
+                    except (TypeError, ValueError):
+                        timeout_val = None
+                    if timeout_val is not None and timeout_val > max_hook_timeout:
+                        warn(
+                            f"{label} timeout {timeout_val}s exceeds the Hermes ceiling "
+                            f"{max_hook_timeout}s",
+                            f"(silently clamped to {max_hook_timeout}s; a killed hook returns "
+                            "no directive and the host reads that as ALLOW)",
+                        )
+
+    # ── provider references: model + auxiliary (profiles do NOT inherit) ─
+    if builtin_provider_ids is not None:
+        model_cfg = cfg.get("model")
+        if isinstance(model_cfg, dict):
+            provider_raw = str(model_cfg.get("provider") or "").strip()
+            if provider_raw and _provider_reference_problem(provider_raw, cfg, builtin_provider_ids):
+                fail(
+                    f"model.provider '{provider_raw}' is not defined in this profile "
+                    f"and is not a built-in provider",
+                    "(profiles do NOT inherit the root config — this silently falls back or 401s at first call)",
+                )
+        aux_cfg = cfg.get("auxiliary")
+        if isinstance(aux_cfg, dict):
+            for task, task_cfg in sorted(aux_cfg.items()):
+                if not isinstance(task_cfg, dict):
+                    continue
+                if str(task_cfg.get("base_url") or "").strip():
+                    continue  # direct endpoint configured; provider name is not the router
+                provider_raw = str(task_cfg.get("provider") or "").strip()
+                if provider_raw and _provider_reference_problem(
+                    provider_raw, cfg, builtin_provider_ids,
+                    extra_ok={"main", "codex"},  # auxiliary-only sentinel values
+                ):
+                    warn(
+                        f"auxiliary.{task}.provider '{provider_raw}' is not defined in "
+                        f"this profile and is not a built-in provider",
+                        f"(the {task} auxiliary silently fails over or does nothing — no inheritance from root)",
+                    )
+
+    # ── toolsets entries that resolve to nothing (incl. MCP references) ──
+    mcp_servers = cfg.get("mcp_servers") if isinstance(cfg.get("mcp_servers"), dict) else {}
+    mcp_enabled: set = set()
+    mcp_disabled: set = set()
+    for name, server_cfg in mcp_servers.items():
+        if not isinstance(server_cfg, dict):
+            continue
+        enabled_flag = server_cfg.get("enabled", True)
+        if isinstance(enabled_flag, str):
+            enabled_flag = enabled_flag.strip().lower() not in ("false", "0", "no", "off")
+        if enabled_flag:
+            mcp_enabled.add(str(name))
+        else:
+            mcp_disabled.add(str(name))
+
+    try:
+        from toolsets import resolve_toolset as _resolve_toolset
+        from toolsets import validate_toolset as _validate_toolset
+    except Exception as exc:
+        _validate_toolset = None
+        _resolve_toolset = None
+        if _profile_operative_toolsets(cfg) is not None:
+            # A doctor that silently skips a check is the bug class this
+            # section exists to catch — say the check did not run.
+            warn(
+                "toolset-reference check could not run",
+                f"(toolsets module not importable: {exc})",
+            )
+
+    if _validate_toolset is not None:
+        toolset_sources: list = [("toolsets", cfg.get("toolsets"))]
+        platform_toolsets_cfg = cfg.get("platform_toolsets")
+        if isinstance(platform_toolsets_cfg, dict):
+            for plat, lst in platform_toolsets_cfg.items():
+                toolset_sources.append((f"platform_toolsets.{plat}", lst))
+        checked: set = set()
+        for source, entries in toolset_sources:
+            if not isinstance(entries, list):
+                continue
+            for ts in entries:
+                if not isinstance(ts, str) or not ts or (source, ts) in checked:
+                    continue
+                checked.add((source, ts))
+                if ts == "no_mcp" or ts in mcp_enabled:
+                    continue
+                if ts in mcp_disabled:
+                    warn(
+                        f"{source} references MCP server '{ts}' which is defined but "
+                        f"enabled: false",
+                        "(its tools are silently absent)",
+                    )
+                    continue
+                try:
+                    # validate_toolset alone under-approximates: registry
+                    # aliases (e.g. hermes-<platform> composites) resolve at
+                    # runtime while failing validate_toolset. A name is only a
+                    # finding when it neither validates NOR resolves to tools.
+                    is_valid = bool(_validate_toolset(ts)) or bool(
+                        _resolve_toolset(ts) if _resolve_toolset is not None else False
+                    )
+                except Exception:
+                    is_valid = True  # cannot judge — do not invent a finding
+                if is_valid or ts in enabled_plugin_toolset_literals:
+                    continue
+                warn(
+                    f"{source} entry '{ts}' matches no built-in toolset, no enabled "
+                    f"plugin's toolset, and no mcp_servers entry",
+                    "(silently dropped — the tools it names never load)",
+                )
+
+    # ── dangling symlinks under skills/ and plugins/ ─────────────────────
+    for sub in ("skills", "plugins"):
+        dangling = _dangling_symlinks_under(profile_dir / sub)
+        shown = dangling[:6]
+        for rel, target in shown:
+            warn(
+                f"{sub}/{rel} is a dangling symlink → {target}",
+                f"(this {'skill' if sub == 'skills' else 'plugin file'} is silently invisible)",
+            )
+        if len(dangling) > len(shown):
+            warn(
+                f"{sub}/: {len(dangling) - len(shown)} more dangling symlink(s)",
+                "(each one is a silently invisible skill/plugin)",
+            )
+
+    return findings
+
+
+def _check_profile_shape(
+    issues: list,
+    *,
+    profiles_root: Path | None = None,
+    root_home: Path | None = None,
+    bundled_plugins_root: Path | None = None,
+) -> None:
+    """Doctor section: per-profile silent-drift audit (read-only).
+
+    Scans the root profile plus every directory under the profiles root.
+    Quiet when a profile is sound; each finding says what silently breaks.
+    A check that cannot run is reported as such — never skipped silently.
+    """
+    if profiles_root is None or root_home is None:
+        try:
+            from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root
+            if root_home is None:
+                root_home = _get_default_hermes_home()
+            if profiles_root is None:
+                profiles_root = _get_profiles_root()
+        except Exception as exc:
+            _section("Profile Shape (silent drift)")
+            check_warn("Profile shape checks could not run", f"(profile paths unresolvable: {exc})")
+            return
+    if bundled_plugins_root is None:
+        bundled_plugins_root = PROJECT_ROOT / "plugins"
+
+    targets: list = [("root", root_home)]
+    if profiles_root.is_dir():
+        try:
+            for child in sorted(profiles_root.iterdir()):
+                if child.is_dir() and not child.name.startswith("."):
+                    targets.append((child.name, child))
+        except OSError as exc:
+            _section("Profile Shape (silent drift)")
+            check_warn("Profile shape checks could not run", f"(profiles dir unreadable: {exc})")
+            return
+
+    _section("Profile Shape (silent drift)")
+
+    builtin_provider_ids = _offline_builtin_provider_ids()
+    if builtin_provider_ids is None:
+        check_warn(
+            "Provider-reference checks could not run",
+            "(no offline provider catalog source is importable)",
+        )
+
+    try:
+        from agent.shell_hooks import MAX_TIMEOUT_SECONDS as _max_hook_timeout
+    except Exception:
+        _max_hook_timeout = None
+        check_warn(
+            "Hook timeout-ceiling check could not run",
+            "(agent.shell_hooks not importable)",
+        )
+    try:
+        from hermes_cli.plugins import VALID_HOOKS as _valid_hooks
+        _valid_hook_events = set(_valid_hooks)
+    except Exception:
+        _valid_hook_events = None
+        check_warn(
+            "Hook event-name check could not run",
+            "(hermes_cli.plugins.VALID_HOOKS not importable)",
+        )
+
+    total_findings = 0
+    clean = 0
+    for name, pdir in targets:
+        try:
+            findings = _profile_shape_findings(
+                pdir,
+                bundled_plugins_root=bundled_plugins_root,
+                builtin_provider_ids=builtin_provider_ids,
+                max_hook_timeout=_max_hook_timeout,
+                valid_hook_events=_valid_hook_events,
+            )
+        except Exception as exc:  # a broken profile must not kill doctor —
+            # but a skipped check must be visible, never silent.
+            check_warn(f"{name}: shape check could not run", f"({exc})")
+            continue
+        if not findings:
+            clean += 1
+            continue
+        total_findings += len(findings)
+        fails = sum(1 for sev, _, _ in findings if sev == "fail")
+        for sev, text, detail in findings:
+            if sev == "fail":
+                check_fail(f"{name}: {text}", detail)
+            else:
+                check_warn(f"{name}: {text}", detail)
+        issues.append(
+            f"Profile '{name}': {len(findings)} silent-drift issue(s)"
+            + (f" ({fails} blocking)" if fails else "")
+            + " — see the ◆ Profile Shape (silent drift) section"
+        )
+
+    if total_findings == 0:
+        check_ok(f"{len(targets)} profile(s) scanned — no silent drift found")
+    elif clean:
+        check_ok(f"{clean} of {len(targets)} profile(s) clean")
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -2391,6 +3128,13 @@ def run_doctor(args):
         pass
     except Exception:
         pass
+
+    # Per-profile silent-drift audit (fail-open hooks, excluded plugin
+    # toolsets, undefined provider references, dangling skill symlinks).
+    try:
+        _check_profile_shape(issues)
+    except Exception as e:
+        check_warn("Profile shape check failed", f"({e})")
 
     print()
     remaining_issues = issues + manual_issues

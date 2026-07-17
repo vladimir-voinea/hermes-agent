@@ -2028,13 +2028,144 @@ class PluginManager:
 
 _plugin_manager: Optional[PluginManager] = None
 
+# Per-profile PluginManagers for the multiplexed gateway.
+#
+# A profile-multiplexing gateway serves several profiles from one process,
+# scoping each turn's HERMES_HOME via a contextvar override
+# (``gateway.run._profile_runtime_scope``). Plugins and shell hooks were
+# historically discovered ONCE at startup into the process-global manager —
+# so a turn routed to profile X ran with the DEFAULT profile's plugins and
+# hooks (X's guards silently never fired; see the per-profile hook tests in
+# ``tests/gateway/test_multiplex_profile_plugins_hooks.py``).
+#
+# The fix: in multiplex mode, a context whose home override points at a
+# non-default profile home resolves its OWN manager from this registry —
+# matching what ``hermes -p <profile>`` gets in its own process. Keyed by
+# the normalized profile home path. Guarded by ``is_multiplex_active()``:
+# single-profile processes (CLI, non-multiplexed gateway) never consult
+# this registry and keep the exact historical singleton behavior.
+_profile_plugin_managers: Dict[str, PluginManager] = {}
+_profile_plugin_managers_lock = threading.Lock()
+
+
+def _normalize_home_key(path: str) -> str:
+    """Normalize a home path for use as a profile-manager registry key."""
+    try:
+        return os.path.realpath(os.path.expanduser(str(path)))
+    except (OSError, ValueError):
+        return str(path)
+
+
+def _process_base_home() -> str:
+    """The process-level HERMES_HOME, ignoring any context-local override.
+
+    Mirrors :func:`hermes_constants.get_hermes_home` resolution minus the
+    contextvar override: the ``HERMES_HOME`` env var when set, else the
+    platform default. This is "the multiplexer's own home" — the default
+    profile — whose plugins/hooks live on the process-global manager.
+    """
+    val = os.environ.get("HERMES_HOME", "").strip()
+    if val:
+        return val
+    from hermes_constants import _get_platform_default_hermes_home
+    return str(_get_platform_default_hermes_home())
+
+
+def current_profile_scope_key() -> Optional[str]:
+    """Return the plugin-manager scope key for the current context, or ``None``.
+
+    ``None`` means "use the process-global manager". That is always the
+    answer when the process is not a profile multiplexer, and also inside a
+    multiplexer when no home override is active or the override points at
+    the process's own base home (the default profile).
+
+    A non-``None`` key is the normalized profile home path of the routed
+    profile — the key into :data:`_profile_plugin_managers`.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+        if not is_multiplex_active():
+            return None
+        from hermes_constants import get_hermes_home_override
+        override = get_hermes_home_override()
+        if not override:
+            return None
+        key = _normalize_home_key(override)
+        if key == _normalize_home_key(_process_base_home()):
+            return None
+        return key
+    except Exception:
+        # Losing scope resolution silently would re-create the exact bug this
+        # exists to fix (a profile's guards not firing) — be loud about it.
+        logger.warning(
+            "profile plugin-manager scope resolution failed; falling back to "
+            "the process-global plugin manager", exc_info=True,
+        )
+        return None
+
 
 def get_plugin_manager() -> PluginManager:
-    """Return (and lazily create) the global PluginManager singleton."""
+    """Return the PluginManager for the current context.
+
+    Single-profile processes (CLI, non-multiplexed gateway) always get the
+    lazily-created process-global singleton — the historical behavior. In a
+    profile-multiplexing gateway, a context whose HERMES_HOME override points
+    at a non-default profile home gets that profile's own manager, so each
+    profile's plugins, hooks, and commands are discovered from and scoped to
+    its own home (matching ``hermes -p <profile>`` in its own process).
+    """
+    scope = current_profile_scope_key()
+    if scope is not None:
+        with _profile_plugin_managers_lock:
+            manager = _profile_plugin_managers.get(scope)
+            if manager is None:
+                manager = PluginManager()
+                _profile_plugin_managers[scope] = manager
+        return manager
     global _plugin_manager
     if _plugin_manager is None:
         _plugin_manager = PluginManager()
     return _plugin_manager
+
+
+def foreign_profile_plugin_tool_names() -> Set[str]:
+    """Tool names owned exclusively by OTHER profiles' plugin managers.
+
+    Plugin tools land in the process-global ``tools.registry`` regardless of
+    which profile's manager loaded them, so in a multiplexer another
+    profile's plugin tools would otherwise be visible to (and callable from)
+    every profile's turns. This returns the set to subtract for the current
+    context: every plugin tool name tracked by a manager other than the
+    current context's manager, minus the current manager's own names (a tool
+    provided by a plugin BOTH profiles enable stays visible).
+
+    Empty set when multiplexing is off — zero behavior change for
+    single-profile processes.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+        if not is_multiplex_active():
+            return set()
+    except Exception:
+        return set()
+
+    current = get_plugin_manager()
+    with _profile_plugin_managers_lock:
+        managers: List[PluginManager] = list(_profile_plugin_managers.values())
+    if _plugin_manager is not None and _plugin_manager not in managers:
+        managers.append(_plugin_manager)
+
+    foreign: Set[str] = set()
+    for manager in managers:
+        if manager is not current:
+            foreign.update(manager._plugin_tool_names)
+    return foreign - set(current._plugin_tool_names)
+
+
+def _reset_profile_plugin_managers_for_tests() -> None:
+    """Drop all per-profile managers. Test-only helper."""
+    with _profile_plugin_managers_lock:
+        _profile_plugin_managers.clear()
 
 
 def discover_plugins(force: bool = False) -> None:

@@ -42,12 +42,18 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    _turn_telemetry_calls=None,
     _pending_verification_response=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
     Lifted verbatim from ``run_conversation`` (the region after the main agent
     loop). See module docstring.
+
+    ``_turn_telemetry_calls`` is the optional list of ``PerCallUsage`` records
+    accumulated during the tool-calling loop (see agent/turn_telemetry.py).
+    Defaults to ``None`` (treated as empty) so existing callers/tests that
+    predate the telemetry feature keep working unmodified.
     """
     from agent.conversation_loop import logger
 
@@ -286,6 +292,44 @@ def finalize_turn(
     else:
         logger.info(_diag_msg, *_diag_args)
 
+    # ── Turn telemetry (TPS + vLLM prefix-cache hit %) ──────────────────
+    # Aggregates the per-call PerCallUsage records captured during the tool
+    # loop (agent/conversation_loop.py, right where the CLI cache-stats
+    # display already reads canonical_usage) into one TurnTelemetry record,
+    # then fans it out to the JSONL sink and the gateway log line.  Gated by
+    # ``telemetry.enabled`` in config.yaml (default True).  The Telegram
+    # footer is rendered separately by the gateway at the delivery chokepoint
+    # (gateway/run.py) — this block only produces the data + the two
+    # always-local surfaces (log + JSONL); it stashes the TurnTelemetry on
+    # the result dict so the gateway can render the footer without
+    # recomputing anything.
+    #
+    # Never allowed to affect the turn: every step below is try/except-
+    # wrapped, and a missing/False config just skips the block entirely.
+    _turn_telemetry = None
+    try:
+        _telemetry_cfg = agent._telemetry_config() if hasattr(agent, "_telemetry_config") else {
+            "enabled": True, "telegram_footer": True, "jsonl": True,
+        }
+        if _telemetry_cfg.get("enabled", True):
+            from agent.turn_telemetry import (
+                aggregate_turn_telemetry,
+                append_turn_jsonl,
+                format_log_line,
+            )
+            _turn_telemetry = aggregate_turn_telemetry(
+                _turn_telemetry_calls or [],
+                model=agent.model,
+                provider=agent.provider,
+                session_id=agent.session_id or "",
+            )
+            if _turn_telemetry is not None:
+                logger.info(format_log_line(_turn_telemetry))
+                if _telemetry_cfg.get("jsonl", True):
+                    append_turn_jsonl(_turn_telemetry)
+    except Exception as _telemetry_err:
+        logger.debug("turn_telemetry: finalize_turn block failed: %s", _telemetry_err, exc_info=True)
+
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this
     # turn and were never superseded by a successful write to the same
@@ -467,6 +511,12 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    # Turn telemetry (TPS + cache-hit %) — present only when computed above
+    # (telemetry.enabled config on AND at least one API call reported usage).
+    # The gateway reads this to render the Telegram footer at its delivery
+    # chokepoint (gateway/run.py) without recomputing anything.
+    if _turn_telemetry is not None:
+        result["turn_telemetry"] = _turn_telemetry
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

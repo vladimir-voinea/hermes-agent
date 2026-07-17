@@ -2387,6 +2387,16 @@ def _accent_hex() -> str:
         return "#FFBF00"
 
 
+def _repl_v2() -> bool:
+    """True when --repl2 (flat opencode REPL) is active."""
+    return os.environ.get("HERMES_REPL_VARIANT") == "2"
+
+
+def _user_glyph() -> str:
+    """User-message marker: flat prompt caret in v2, classic bullet otherwise."""
+    return "❯" if _repl_v2() else "●"
+
+
 def _rich_text_from_ansi(text: str) -> _RichText:
     """Safely render assistant/tool output that may contain ANSI escapes.
 
@@ -5490,7 +5500,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         )
         lines = user_input.split("\n")
         if len(lines) <= 1:
-            return f"[bold {_accent_hex()}]●[/] [bold]{_escape(user_input)}[/]{ts_suffix}"
+            return f"[bold {_accent_hex()}]{_user_glyph()}[/] [bold]{_escape(user_input)}[/]{ts_suffix}"
 
         first_lines = int(getattr(self, "user_message_preview_first_lines", 2))
         last_lines = int(getattr(self, "user_message_preview_last_lines", 2))
@@ -5507,7 +5517,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             tail = []
 
         preview_lines = [
-            f"[bold {_accent_hex()}]●[/] [bold]{_escape(head[0])}[/]{ts_suffix}"
+            f"[bold {_accent_hex()}]{_user_glyph()}[/] [bold]{_escape(head[0])}[/]{ts_suffix}"
         ]
         preview_lines.extend(f"[bold]{_escape(line)}[/]" for line in head[1:])
 
@@ -5539,12 +5549,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
     def _print_user_message_preview(self, user_input: str) -> None:
         """Render a user message using the normal chat scrollback style."""
-        ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+        if _repl_v2():
+            # Flat: a blank line of turn-air instead of a rule, then a caret.
+            ChatConsole().print("")
+        else:
+            ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
         text = str(user_input or "")
         if "\n" in text:
             ChatConsole().print(self._format_submitted_user_message_preview(text))
         else:
-            ChatConsole().print(f"[bold {_accent_hex()}]●[/] [bold]{_escape(text)}[/]")
+            ChatConsole().print(f"[bold {_accent_hex()}]{_user_glyph()}[/] [bold]{_escape(text)}[/]")
 
     def _stream_reasoning_delta(self, text: str) -> None:
         """Stream reasoning/thinking tokens into a dim box above the response.
@@ -5566,20 +5580,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Open reasoning box on first reasoning token
         if not getattr(self, "_reasoning_box_opened", False):
             self._reasoning_box_opened = True
-            w = self._scrollback_box_width()
-            r_label = " Reasoning "
-            r_fill = w - 2 - len(r_label)
-            _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
+            if _repl_v2():
+                # Flat: no reasoning box — dim-italic lines, indented.
+                _cprint("")
+            else:
+                w = self._scrollback_box_width()
+                r_label = " Reasoning "
+                r_fill = w - 2 - len(r_label)
+                _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
 
         self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
+        _rpad = _STREAM_PAD if _repl_v2() else ""
 
         # Emit complete lines, and force-flush long partial lines so
         # reasoning is visible in real-time even without newlines.
         while "\n" in self._reasoning_buf:
             line, self._reasoning_buf = self._reasoning_buf.split("\n", 1)
-            _cprint(f"{_DIM}{line}{_RST}")
+            _cprint(f"{_rpad}{_DIM}{line}{_RST}")
         if len(self._reasoning_buf) > 80:
-            _cprint(f"{_DIM}{self._reasoning_buf}{_RST}")
+            _cprint(f"{_rpad}{_DIM}{self._reasoning_buf}{_RST}")
             self._reasoning_buf = ""
 
     def _close_reasoning_box(self) -> None:
@@ -5588,10 +5607,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Flush remaining reasoning buffer
             buf = getattr(self, "_reasoning_buf", "")
             if buf:
-                _cprint(f"{_DIM}{buf}{_RST}")
+                _cprint(f"{_STREAM_PAD if _repl_v2() else ''}{_DIM}{buf}{_RST}")
                 self._reasoning_buf = ""
-            w = self._scrollback_box_width()
-            _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
+            if not _repl_v2():
+                w = self._scrollback_box_width()
+                _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
             self._reasoning_box_opened = False
 
             # Flush any content that was deferred while reasoning was rendering.
@@ -5787,9 +5807,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self._stream_text_ansi = ""
             if self.show_timestamps:
                 label = f"{label} {datetime.now().strftime(getattr(self, 'timestamp_format', '%H:%M'))}"
-            w = self._scrollback_box_width()
-            fill = w - 2 - HermesCLI._status_bar_display_width(label)
-            _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+            if _repl_v2():
+                # Flat: no box header — the response simply flows, indented,
+                # after a single blank line of separation.
+                _cprint("")
+            else:
+                w = self._scrollback_box_width()
+                fill = w - 2 - HermesCLI._status_bar_display_width(label)
+                _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
 
         self._stream_buf += text
 
@@ -5913,8 +5938,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
             self._stream_buf = ""
 
-        # Close the response box
-        if self._stream_box_opened:
+        # Close the response box (flat v2 has no box to close)
+        if self._stream_box_opened and not _repl_v2():
             w = self._scrollback_box_width()
             _cprint(f"{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
 
@@ -5933,6 +5958,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._deferred_content = ""
         self._stream_table_buf = []
         self._in_stream_table = False
+        self._tool_args_state = {}
+        self._tool_args_active_idx = None
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -6144,6 +6171,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # logged at DEBUG by the advisory module.
             pass
 
+    def _show_v2_banner(self) -> None:
+        """Minimal flat banner for --repl2 — one quiet line, no ASCII, no box."""
+        from hermes_cli.skin_engine import get_active_skin
+        s = get_active_skin()
+        acc = s.get_color("ui_accent", "#7aa2f7")
+        dim = s.get_color("banner_dim", "#6b7089")
+        faint = s.get_color("session_border", "#2a2e3a")
+        name = s.get_branding("agent_name", "hermes")
+        model = getattr(self, "model", "") or ""
+        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+        home = os.path.expanduser("~")
+        if cwd.startswith(home):
+            cwd = "~" + cwd[len(home):]
+        sep = f"[{faint}]  ·  [/]"
+        ChatConsole().print(
+            f"[{faint}]⚕[/] [bold {acc}]{name}[/]{sep}[{dim}]{model}[/]{sep}[{dim}]{cwd}[/]"
+        )
+        welcome = s.get_branding("welcome", "Type your message or /help for commands.")
+        ChatConsole().print(f"[{dim}]{welcome}[/]")
+
     def show_banner(self):
         """Display the welcome banner in Claude Code style."""
         self.console.clear()
@@ -6156,7 +6203,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         term_width = shutil.get_terminal_size().columns
         use_compact = self.compact or term_width < 80
         
-        if use_compact:
+        if _repl_v2():
+            self._show_v2_banner()
+        elif use_compact:
             self._console_print(_build_compact_banner())
             self._show_status()
         else:
@@ -11017,10 +11066,155 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._flush_stream()
             self._stream_box_opened = False
         self._close_reasoning_box()
+        # Close a previous tool's live-args box before announcing the next tool.
+        self._close_tool_args_box()
 
-        from agent.display import get_tool_emoji
-        emoji = get_tool_emoji(tool_name, default="⚡")
-        _cprint(f"  ┊ {emoji} preparing {tool_name}…")
+        if _repl_v2():
+            # Flat: a dim caret-gutter row, no emoji, no ┊ pipe. Indented to
+            # _STREAM_PAD so it aligns with the response / reasoning content.
+            _cprint(f"{_STREAM_PAD}{_DIM}› {tool_name}…{_RST}")
+        else:
+            from agent.display import get_tool_emoji
+            emoji = get_tool_emoji(tool_name, default="⚡")
+            _cprint(f"  ┊ {emoji} preparing {tool_name}…")
+
+    # ====================================================================
+    # Live tool-argument streaming (real-time write_file content, etc.)
+    # ====================================================================
+
+    # Tool-argument JSON fields worth live-streaming (the big text payload),
+    # and the fields that name the file (used only for the box header).
+    _TOOL_ARGS_PREVIEW_FIELDS = ("content", "new_string", "new_str", "file_text", "text", "code")
+    _TOOL_ARGS_PATH_FIELDS = ("file_path", "path", "filename", "target_file", "file")
+
+    @staticmethod
+    def _find_json_string_value(s: str, keys):
+        """Return (value_start, key) for the earliest ``"key"\\s*:\\s*"`` among
+        ``keys`` in ``s`` (value_start = index just past the opening quote), or
+        (None, None). Earliest-match wins so JSON key order doesn't matter."""
+        import re
+        best_pos = None
+        best = (None, None)
+        for k in keys:
+            m = re.search(r'"' + re.escape(k) + r'"\s*:\s*"', s)
+            if m and (best_pos is None or m.end() < best_pos):
+                best_pos = m.end()
+                best = (m.end(), k)
+        return best
+
+    @staticmethod
+    def _decode_json_str_chunk(s: str, start: int):
+        """Decode a JSON string body from ``start`` up to the closing quote or
+        the end of available text.  Returns (decoded, ended, next_start).
+        Stops BEFORE an incomplete trailing escape (``\\`` or partial ``\\uXXXX``
+        at end of ``s``) so the caller can resume at ``next_start`` when more
+        text streams in — keeping the whole scan O(total content), not O(n²)."""
+        out = []
+        i = start
+        n = len(s)
+        _SIMPLE = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\",
+                   "/": "/", "b": "\b", "f": "\f"}
+        while i < n:
+            c = s[i]
+            if c == '"':
+                return ("".join(out), True, i)
+            if c == "\\":
+                if i + 1 >= n:
+                    break  # escape char not yet arrived
+                e = s[i + 1]
+                if e in _SIMPLE:
+                    out.append(_SIMPLE[e]); i += 2
+                elif e == "u":
+                    if i + 6 > n:
+                        break  # incomplete \uXXXX
+                    try:
+                        out.append(chr(int(s[i + 2:i + 6], 16)))
+                    except ValueError:
+                        out.append(s[i + 2:i + 6])
+                    i += 6
+                else:
+                    out.append(e); i += 2
+            else:
+                out.append(c); i += 1
+        return ("".join(out), False, i)
+
+    def _on_tool_args_delta(self, idx: int, tool_name: str, accumulated_args: str) -> None:
+        """Live-render a streaming tool call's big text payload (e.g. a one-shot
+        45 KB ``write_file`` content field) so the screen shows the file being
+        written in real time instead of freezing on a ``preparing…`` spinner."""
+        if not getattr(self, "streaming_enabled", False):
+            return
+        state = getattr(self, "_tool_args_state", None)
+        if state is None:
+            state = self._tool_args_state = {}
+        st = state.get(idx)
+        if st is None:
+            st = state[idx] = {"scan": None, "buf": "", "open": False, "skip": False, "done": False}
+        if st["skip"] or st["done"]:
+            return
+        # Locate the payload field's value the first time it appears.
+        if st["scan"] is None:
+            vstart, _f = self._find_json_string_value(accumulated_args, self._TOOL_ARGS_PREVIEW_FIELDS)
+            if vstart is None:
+                # No previewable field.  Give up once the JSON has clearly moved
+                # past where it'd appear (small tools like read_file/bash).
+                if len(accumulated_args) > 800 or accumulated_args.rstrip().endswith("}"):
+                    st["skip"] = True
+                return
+            st["scan"] = vstart
+        new, ended, next_scan = self._decode_json_str_chunk(accumulated_args, st["scan"])
+        st["scan"] = next_scan
+        if not new and not ended:
+            return
+        active = getattr(self, "_tool_args_active_idx", None)
+        if active is not None and active != idx:
+            self._close_tool_args_box()
+        if not st["open"]:
+            if getattr(self, "_stream_box_opened", False):
+                self._flush_stream()
+                self._stream_box_opened = False
+            self._close_reasoning_box()
+            pstart, _pk = self._find_json_string_value(accumulated_args, self._TOOL_ARGS_PATH_FIELDS)
+            path = None
+            if pstart is not None:
+                path, _pe, _pn = self._decode_json_str_chunk(accumulated_args, pstart)
+            w = self._scrollback_box_width()
+            label = f" ✎ {path or tool_name or 'writing'} "
+            if len(label) > w - 4:
+                label = label[: w - 4]
+            fill = w - 2 - len(label)
+            _cprint(f"{_DIM}┌─{label}{'─' * max(fill - 1, 0)}┐{_RST}")
+            st["open"] = True
+            self._tool_args_active_idx = idx
+        st["buf"] += new
+        while "\n" in st["buf"]:
+            line, st["buf"] = st["buf"].split("\n", 1)
+            _cprint(f"{_DIM}{line}{_RST}")
+        if len(st["buf"]) > 160:  # force-flush long unbroken lines
+            _cprint(f"{_DIM}{st['buf']}{_RST}")
+            st["buf"] = ""
+        if ended:
+            self._close_tool_args_box()
+            st["done"] = True
+
+    def _close_tool_args_box(self) -> None:
+        """Flush + close the live tool-args box if one is open."""
+        state = getattr(self, "_tool_args_state", None)
+        if not state:
+            return
+        closed = False
+        for st in state.values():
+            if st.get("open"):
+                buf = st.get("buf", "")
+                if buf:
+                    _cprint(f"{_DIM}{buf}{_RST}")
+                    st["buf"] = ""
+                st["open"] = False
+                closed = True
+        if closed:
+            w = self._scrollback_box_width()
+            _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
+        self._tool_args_active_idx = None
 
     # ====================================================================
     # Tool progress callback (audio cues for voice mode)
@@ -11157,6 +11351,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
     def _on_tool_start(self, tool_call_id: str, function_name: str, function_args: dict):
         """Capture local before-state for write-capable tools."""
+        # Close the live-args box (if still open) before the tool result / diff
+        # renders — this is the backstop if the stream ended without a closing
+        # quote (truncation / interrupt).
+        self._close_tool_args_box()
         try:
             from agent.display import capture_local_edit_snapshot
 
@@ -11340,6 +11538,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         submitted = False
         transcription_failed = False
+        keep_recording = False
         wav_path = None
         try:
             if self._voice_recorder is None:
@@ -11357,6 +11556,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             if wav_path is None:
                 _cprint(f"{_DIM}No speech detected.{_RST}")
+                return
+
+            # Native audio path: when the active model accepts input_audio
+            # content (Nemotron-3 Nano Omni etc.), skip STT and hand the raw
+            # WAV to chat() as a 3-tuple.  chat() re-decides against the
+            # turn-resolved model and degrades to STT there if needed — this
+            # is only the record-time routing hint.
+            try:
+                from agent.audio_routing import decide_audio_input_mode
+                from hermes_cli.config import load_config
+                _audio_mode = decide_audio_input_mode(
+                    (self.provider or "").strip(),
+                    (self.model or "").strip(),
+                    load_config(),
+                )
+            except Exception:
+                _audio_mode = "stt"
+            if _audio_mode == "native":
+                self._attached_images.clear()
+                if hasattr(self, '_app') and self._app:
+                    self._app.invalidate()
+                self._pending_input.put(("[voice message]", [], [wav_path]))
+                submitted = True
+                keep_recording = True
+                _cprint(f"{_DIM}Voice → native audio (no STT).{_RST}")
                 return
 
             # _voice_processing is already True (set atomically above)
@@ -11399,9 +11623,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if hasattr(self, '_app') and self._app:
                 self._app.invalidate()
             # Clean up temp file unless transcription failed. On failure, keep
-            # the source recording so long dictation is not lost.
+            # the source recording so long dictation is not lost.  Native-audio
+            # submissions also keep the WAV — chat() reads it at send time.
             try:
-                if wav_path and os.path.isfile(wav_path):
+                if wav_path and os.path.isfile(wav_path) and not keep_recording:
                     if transcription_failed:
                         _cprint(f"{_DIM}Recording preserved at: {wav_path}{_RST}")
                     else:
@@ -12166,22 +12391,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None) -> Optional[str]:
+    def chat(self, message, images: list = None, audio: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
-        
+
         Handles streaming output, interrupt detection (user typing while agent
         is working), and re-queueing of interrupted messages.
-        
+
         Uses a dedicated _interrupt_queue (separate from _pending_input) to avoid
         race conditions between the process_loop and interrupt monitoring. Messages
         typed while the agent is running go to _interrupt_queue; messages typed while
         idle go to _pending_input.
-        
+
         Args:
             message: The user's message (str or multimodal content list)
             images: Optional list of Path objects for attached images
-            
+            audio: Optional list of WAV path strings from /voice recordings
+
         Returns:
             The agent's response, or None on error
         """
@@ -12272,6 +12498,82 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 message = self._preprocess_images_with_vision(
                     message if isinstance(message, str) else "", images
                 )
+
+        # Route voice recordings based on the active model's audio capability.
+        # The record-time decision in _voice_stop_and_transcribe was only a
+        # hint — the model may have changed between record and send (per-turn
+        # routing, /model mid-queue), so re-decide against the TURN-RESOLVED
+        # model here. Anything short of a clean native attach degrades to STT
+        # so the turn always goes through. See agent/audio_routing.py.
+        if audio:
+            _audio_parts = None
+            try:
+                from agent.audio_routing import (
+                    build_native_audio_parts,
+                    decide_audio_input_mode,
+                )
+                from hermes_cli.config import load_config
+
+                _audio_mode = decide_audio_input_mode(
+                    (self.provider or "").strip(),
+                    (self.model or "").strip(),
+                    load_config(),
+                )
+                if _audio_mode == "native":
+                    _caption = message if isinstance(message, str) else ""
+                    if _caption.strip() == "[voice message]":
+                        _caption = ""
+                    _audio_parts, _audio_err = build_native_audio_parts(
+                        _caption,
+                        str(audio[0]),
+                        voice_mode=bool(self._voice_mode),
+                    )
+                    if _audio_err:
+                        logging.warning("native audio attach failed: %s", _audio_err)
+            except Exception as _audio_exc:
+                logging.warning("audio_routing failed, falling back to STT: %s", _audio_exc)
+                _audio_parts = None
+
+            if _audio_parts:
+                _cprint(f"  {_DIM}🎤 attaching voice audio natively{_RST}")
+                if isinstance(message, list):
+                    # Images already built a content-parts list — append only
+                    # the input_audio part so their combined text is kept.
+                    message = message + [
+                        p for p in _audio_parts if p.get("type") == "input_audio"
+                    ]
+                else:
+                    message = _audio_parts
+            else:
+                # Not native (or attach failed) — degrade to the STT path.
+                _cprint(f"{_DIM}Transcribing...{_RST}")
+                try:
+                    from hermes_cli.config import load_config
+                    _stt_model = (load_config().get("stt", {}) or {}).get("model")
+                except Exception:
+                    _stt_model = None
+                try:
+                    from tools.voice_mode import transcribe_recording
+                    _stt_result = transcribe_recording(str(audio[0]), model=_stt_model)
+                except Exception as _stt_exc:
+                    _stt_result = {"success": False, "error": str(_stt_exc)}
+                if _stt_result.get("success") and _stt_result.get("transcript", "").strip():
+                    _transcript = _stt_result["transcript"].strip()
+                    if isinstance(message, str) and message.strip() not in ("", "[voice message]"):
+                        message = f"{message}\n\n{_transcript}"
+                    elif isinstance(message, list):
+                        message = message + [{"type": "text", "text": _transcript}]
+                    else:
+                        message = _transcript
+                else:
+                    _stt_error = _stt_result.get("error", "no speech detected")
+                    _cprint(f"{_DIM}Transcription failed: {_stt_error}{_RST}")
+                    _note = (
+                        f"[Voice recording at {audio[0]} could not be attached "
+                        f"natively or transcribed: {_stt_error}]"
+                    )
+                    if isinstance(message, str) and message.strip() in ("", "[voice message]"):
+                        message = _note
 
         # Expand @ context references (e.g. @file:main.py, @diff, @folder:src/)
         if isinstance(message, str) and "@" in message:
@@ -12409,8 +12711,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _voice_prefix = ""
             if self._voice_mode and isinstance(message, str):
                 _voice_prefix = (
-                    "[Voice input — respond concisely and conversationally, "
-                    "2-3 sentences max. No code blocks or markdown.] "
+                    "[Voice input — do the task exactly as you normally would: use tools, "
+                    "run commands, edit files, and reason through as many steps as it takes. "
+                    "This only shapes your final spoken reply, which will be read aloud by "
+                    "text-to-speech — so write that reply for the ear, not the screen: plain "
+                    "spoken language, no markdown, code blocks, bullet lists, tables, URLs, or "
+                    "symbols to be read out. If you did work, say what you did and how it turned "
+                    "out rather than pasting it. Let the length fit the content — a word or two "
+                    "when that's the answer, a few sentences when more is genuinely needed — but "
+                    "stay tight and skip filler.] "
                 )
 
             def run_agent():
@@ -15368,10 +15677,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
 
-                    # Unpack image payload: (text, [Path, ...]) or plain str
+                    # Unpack image payload: (text, [Path, ...]) or plain str.
+                    # Voice submissions extend to a 3-tuple with WAV paths:
+                    # (text, [Path, ...], [wav_path, ...]).
                     submit_images = []
+                    submit_audio = []
                     if isinstance(user_input, tuple):
-                        user_input, submit_images = user_input
+                        if len(user_input) == 3:
+                            user_input, submit_images, submit_audio = user_input
+                        else:
+                            user_input, submit_images = user_input
 
                     if isinstance(user_input, str):
                         user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
@@ -15454,7 +15769,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        self.chat(user_input, images=submit_images or None, audio=submit_audio or None)
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -16341,12 +16656,27 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        cli.agent.tool_args_callback = None
+                        # Kanban worker: bridge live operator comments left on
+                        # this card into the running loop as steers, so mid-run
+                        # feedback lands without a block/unblock cycle. No-op for
+                        # every non-kanban `-q` run. See agent.kanban_steer_watcher.
+                        _kanban_steer_watcher = None
+                        try:
+                            from agent.kanban_steer_watcher import (
+                                start_comment_steer_watcher as _start_kanban_steer,
+                            )
+                            _kanban_steer_watcher = _start_kanban_steer(cli.agent)
+                        except Exception:
+                            _kanban_steer_watcher = None
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
                             )
                         except KeyboardInterrupt:
+                            if _kanban_steer_watcher is not None:
+                                _kanban_steer_watcher.stop()
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
@@ -16386,6 +16716,11 @@ def main(
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+
+                        # Worker loop is done — stop the live comment-steer
+                        # watcher so it can't inject after the final turn.
+                        if _kanban_steer_watcher is not None:
+                            _kanban_steer_watcher.stop()
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)

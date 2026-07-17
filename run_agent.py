@@ -456,6 +456,7 @@ class AIAgent:
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
+        tool_args_callback: callable = None,
         status_callback: callable = None,
         notice_callback: callable = None,
         notice_clear_callback: callable = None,
@@ -532,6 +533,7 @@ class AIAgent:
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
             tool_gen_callback=tool_gen_callback,
+            tool_args_callback=tool_args_callback,
             status_callback=status_callback,
             notice_callback=notice_callback,
             notice_clear_callback=notice_clear_callback,
@@ -3058,6 +3060,38 @@ class AIAgent:
             pass
         return True  # safe default: explainer on
 
+    def _telemetry_config(self) -> dict:
+        """Resolve the per-turn generation telemetry config block.
+
+        Config path: ``telemetry.enabled`` / ``telemetry.telegram_footer`` /
+        ``telemetry.jsonl`` (all bool, default True — see
+        ``agent/turn_telemetry.py`` module docstring for the shape).
+        ``HERMES_TELEMETRY`` env var overrides the master ``enabled`` switch
+        only (the two sub-toggles stay config-only; there's no compelling
+        env-var use case for muting just the footer or just the JSONL sink).
+        Exposed as a method so tests can patch a single seam, mirroring
+        ``_file_mutation_verifier_enabled`` / ``_turn_completion_explainer_enabled``.
+        """
+        resolved = {"enabled": True, "telegram_footer": True, "jsonl": True}
+        try:
+            import os as _os
+            env = _os.environ.get("HERMES_TELEMETRY")
+            if env is not None:
+                resolved["enabled"] = env.strip().lower() not in {"0", "false", "no", "off"}
+                return resolved
+            # Read from the persisted config.yaml so gateway and CLI share
+            # the same setting.  Import lazily to avoid a startup-time cycle.
+            try:
+                from hermes_cli.config import load_config as _load_config
+                _cfg = _load_config() or {}
+            except Exception:
+                _cfg = {}
+            from agent.turn_telemetry import telemetry_config as _resolve_telemetry_config
+            return _resolve_telemetry_config(_cfg if isinstance(_cfg, dict) else {})
+        except Exception:
+            pass
+        return resolved  # safe default: everything on
+
     @staticmethod
     def _format_turn_completion_explanation(turn_exit_reason: str) -> str:
         """Render a user-facing explanation for an abnormal turn ending.
@@ -4843,6 +4877,23 @@ class AIAgent:
         if cb is not None:
             try:
                 cb(tool_name)
+            except Exception:
+                pass
+
+    def _fire_tool_args_delta(self, idx: int, tool_name: str, accumulated_args: str) -> None:
+        """Stream partial tool-call arguments to the display as they generate.
+
+        Fires on every arguments delta of a streaming tool call, carrying the
+        FULL accumulated arguments-JSON-so-far (the display re-scans it and
+        emits only the newly-revealed portion).  Lets the TUI live-render a
+        big ``write_file`` content payload instead of freezing on a spinner
+        while dozens of KB stream in one shot.  ``idx`` keys the tool-call
+        slot so parallel/sequential calls in one turn don't collide.
+        """
+        cb = getattr(self, "tool_args_callback", None)
+        if cb is not None:
+            try:
+                cb(idx, tool_name, accumulated_args)
             except Exception:
                 pass
 

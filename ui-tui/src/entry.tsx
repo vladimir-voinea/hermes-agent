@@ -121,12 +121,16 @@ if (process.env.HERMES_HEAPDUMP_ON_START === '1') {
 
 process.on('beforeExit', () => stopMemoryMonitor())
 
-const [ink, { App }, { logFrameEvent }, { trackFrame }] = await Promise.all([
+// --tui2 sets HERMES_TUI_VARIANT=2 to select the experimental v2 view
+// (opencode-style flat transcript). Both specifiers stay literal so esbuild
+// bundles both Apps into the single dist/entry.js; only one is imported.
+const [ink, appMod, { logFrameEvent }, { trackFrame }] = await Promise.all([
   import('@hermes/ink'),
-  import('./app.js'),
+  process.env.HERMES_TUI_VARIANT === '2' ? import('./v2/app.js') : import('./app.js'),
   import('./lib/perfPane.js'),
   import('./lib/fpsStore.js')
 ])
+const { App } = appMod
 
 // Both consumers are undefined when their env flags are off; only attach
 // onFrame when at least one is on so ink skips timing in the default case.

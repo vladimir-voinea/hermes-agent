@@ -139,14 +139,35 @@ MAX_TIMEOUT_SECONDS = 300
 ALLOWLIST_FILENAME = "shell-hooks-allowlist.json"
 _DEFAULT_BLOCK_MESSAGE = "Blocked by shell hook."
 
-# (event, matcher, command) triples that have been wired to the plugin
-# manager in the current process.  Matcher is part of the key because
-# the same script can legitimately register for different matchers under
-# the same event (e.g. one entry per tool the user wants to gate).
-# Second registration attempts for the exact same triple become no-ops
-# so the CLI and gateway can both call register_from_config() safely.
-_registered: Set[Tuple[str, Optional[str], str]] = set()
+# (event, matcher, command) triples that have been wired to a plugin
+# manager are tracked PER MANAGER (``manager._shell_hook_keys``, created
+# lazily below) rather than in one process-global set.  Matcher is part of
+# the key because the same script can legitimately register for different
+# matchers under the same event (e.g. one entry per tool the user wants to
+# gate).  Second registration attempts for the exact same triple on the
+# same manager become no-ops so the CLI and gateway can both call
+# register_from_config() safely.
+#
+# Why per-manager: the profile-multiplexing gateway resolves a DIFFERENT
+# PluginManager per profile (see hermes_cli.plugins.get_plugin_manager), and
+# two profiles may configure the same (event, matcher, command) — e.g. both
+# declare the same guard script.  A process-global set would dedupe the
+# second profile's registration away, silently disarming its guard.  In a
+# single-profile process there is exactly one manager, so the semantics are
+# identical to the historical global set.
 _registered_lock = threading.Lock()
+
+
+def _manager_registered_keys(manager: Any) -> Set[Tuple[str, Optional[str], str]]:
+    """Return (creating if needed) the manager's registered-hook key set.
+
+    Caller must hold ``_registered_lock``.
+    """
+    keys = getattr(manager, "_shell_hook_keys", None)
+    if keys is None:
+        keys = set()
+        manager._shell_hook_keys = keys
+    return keys
 
 # Intra-process lock for allowlist read-modify-write on platforms that
 # lack ``fcntl`` (non-POSIX).  Kept separate from ``_registered_lock``
@@ -253,7 +274,7 @@ def register_from_config(
     for spec in specs:
         key = (spec.event, spec.matcher, spec.command)
         with _registered_lock:
-            if key in _registered:
+            if key in _manager_registered_keys(manager):
                 continue
             already_allowlisted = _is_allowlisted(spec.event, spec.command)
 
@@ -271,10 +292,11 @@ def register_from_config(
                 continue
 
         with _registered_lock:
-            if key in _registered:
+            registered_keys = _manager_registered_keys(manager)
+            if key in registered_keys:
                 continue
             manager._hooks.setdefault(spec.event, []).append(_make_callback(spec))
-            _registered.add(key)
+            registered_keys.add(key)
             registered.append(spec)
             logger.info(
                 "shell hook registered: %s -> %s (matcher=%s, timeout=%ds)",
@@ -293,9 +315,23 @@ def iter_configured_hooks(cfg: Optional[Dict[str, Any]]) -> List[ShellHookSpec]:
 
 
 def reset_for_tests() -> None:
-    """Clear the idempotence set.  Test-only helper."""
+    """Clear the idempotence state on every known manager.  Test-only helper."""
     with _registered_lock:
-        _registered.clear()
+        try:
+            from hermes_cli import plugins as _plugins_mod
+
+            managers = []
+            if _plugins_mod._plugin_manager is not None:
+                managers.append(_plugins_mod._plugin_manager)
+            managers.extend(
+                getattr(_plugins_mod, "_profile_plugin_managers", {}).values()
+            )
+            for manager in managers:
+                keys = getattr(manager, "_shell_hook_keys", None)
+                if keys is not None:
+                    keys.clear()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

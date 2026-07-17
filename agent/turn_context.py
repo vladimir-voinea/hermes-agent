@@ -421,6 +421,11 @@ def build_turn_context(
             tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
+        # Correct the flat ~4 chars/token rough estimate using the learned
+        # real/rough ratio from prior provider prompt_tokens (calibrated_preflight).
+        # Fixes the inflated status display + premature compaction on dense
+        # (code/tool-output) content that tokenizes at ~6.5 chars/token.
+        _preflight_tokens = _compressor.calibrated_preflight(_preflight_tokens)
         _defer_preflight = getattr(
             _compressor,
             "should_defer_preflight_to_real_usage",

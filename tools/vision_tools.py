@@ -1065,6 +1065,7 @@ async def vision_analyze_tool(
     user_prompt: str,
     model: str = None,
     task_id: Optional[str] = None,
+    task: str = "vision",
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -1230,7 +1231,7 @@ async def vision_analyze_tool(
         try:
             from hermes_cli.config import cfg_get, load_config
             _cfg = load_config()
-            _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
+            _vision_cfg = cfg_get(_cfg, "auxiliary", task, default={})
             _vt = _vision_cfg.get("timeout")
             if _vt is not None:
                 vision_timeout = float(_vt)
@@ -1240,7 +1241,7 @@ async def vision_analyze_tool(
         except Exception:
             pass
         call_kwargs = {
-            "task": "vision",
+            "task": task,
             "messages": messages,
             "temperature": vision_temperature,
             "max_tokens": 2000,
@@ -1451,7 +1452,9 @@ VISION_ANALYZE_SCHEMA = {
         "any time the user references an image (filepath in their message, "
         "URL in tool output, screenshot from the browser, etc.). For "
         "non-vision models, falls back to an auxiliary vision model that "
-        "returns a text description."
+        "returns a text description. For a UI SCREENSHOT where you need to "
+        "locate interactive elements, get click coordinates, or check on-screen "
+        "layout/state, use inspect_ui instead."
     ),
     "parameters": {
         "type": "object",
@@ -1518,6 +1521,119 @@ registry.register(
     check_fn=check_vision_requirements,
     is_async=True,
     emoji="👁️",
+)
+
+
+# ---------------------------------------------------------------------------
+# UI Inspection Tool (GUI grounding — Holo)
+# ---------------------------------------------------------------------------
+
+INSPECT_UI_SCHEMA = {
+    "name": "inspect_ui",
+    "description": (
+        "Inspect a UI SCREENSHOT with a GUI-specialized model (Holo) to locate "
+        "interactive elements and read on-screen layout and state. Give it a "
+        "screenshot plus what to find or verify — e.g. 'where is the Submit "
+        "button', 'click point for the search field', 'list the buttons and "
+        "their positions', 'is the login form aligned', 'what state is this "
+        "toggle in'. Returns element locations (pixel coordinates / bounding "
+        "boxes from the top-left) and UI-focused observations. Use this whenever "
+        "you are building, verifying, or driving a UI/app screen and need to act "
+        "on or reason about specific elements — it always routes to the dedicated "
+        "UI-grounding model regardless of your active model. For a general photo "
+        "or non-UI image (not a screen), use vision_analyze instead."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "screenshot": {
+                "type": "string",
+                "description": "Screenshot to inspect: image URL (http/https), local file path, or data: URL.",
+            },
+            "instruction": {
+                "type": "string",
+                "description": "What to locate or verify on the screen — the element to find, or the layout/state question to answer.",
+            },
+        },
+        "required": ["screenshot", "instruction"],
+    },
+}
+
+
+# GUI-grounding framing applied to every inspect_ui call. Holo is Qwen-VL-based
+# and natively emits coordinates normalized to a 0-1000 scale per axis (verified
+# against ground truth), NOT raw pixels — so the prompt asks for that scale
+# instead of fighting the model, and the handler states the convention +
+# pixel-conversion in the returned result (see auxiliary.inspect_ui — Holo-4B on
+# gpu1).
+_INSPECT_UI_PROMPT = (
+    "You are a GUI grounding and UI-analysis model looking at a screenshot of a "
+    "user interface. Task:\n\n{instruction}\n\n"
+    "Coordinate convention: express every location as integers normalized to a "
+    "0-1000 scale per axis — x measured from the left edge, y from the top edge. "
+    "When the task refers to a specific element (or asks where to click or type), "
+    "give its click point as (x, y) and, when you can, a bounding box "
+    "[x1, y1, x2, y2] on that same 0-1000 scale, plus a short label of the "
+    "element. When the task is about layout, alignment, state, or contents, "
+    "answer concisely and refer to specific on-screen elements and their "
+    "normalized positions. Be precise and literal about what is actually "
+    "visible; do not invent elements."
+)
+
+
+async def _handle_inspect_ui(args: Dict[str, Any], **kw: Any) -> str:
+    screenshot = args.get("screenshot") or args.get("image_url") or ""
+    instruction = args.get("instruction") or args.get("question") or ""
+    task_id = kw.get("task_id")
+
+    # Always use the dedicated GUI-grounding backend (auxiliary.inspect_ui →
+    # Holo), never the native-vision fast path: the point is that a grounding
+    # specialist answers even when the active model has its own vision. Route
+    # through vision_analyze_tool with task="inspect_ui" so it reuses the
+    # resolve/normalize/encode/resize + vision-client plumbing.
+    prompt = _INSPECT_UI_PROMPT.format(
+        instruction=instruction or "Describe the UI and locate its interactive elements."
+    )
+
+    model = None
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        _m = cfg_get(load_config(), "auxiliary", "inspect_ui", "model")
+        if _m:
+            model = str(_m).strip() or None
+    except Exception:
+        pass
+
+    raw = await vision_analyze_tool(
+        screenshot, prompt, model, task_id=task_id, task="inspect_ui",
+    )
+
+    # Make the coordinate contract explicit for the caller: Holo returns 0-1000
+    # normalized coords, so any consumer that wants pixels must rescale by the
+    # screenshot's real dimensions. Prepend the convention to the analysis text
+    # rather than parsing/denormalizing here (Q4 output format is free-form).
+    try:
+        obj = json.loads(raw)
+        if obj.get("success") and obj.get("analysis"):
+            obj["analysis"] = (
+                "[inspect_ui: coordinates are normalized to a 0-1000 scale per "
+                "axis — x from the left edge, y from the top. To convert to "
+                "pixels: px_x = x / 1000 * image_width, px_y = y / 1000 * "
+                "image_height.]\n\n" + obj["analysis"]
+            )
+            return json.dumps(obj, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+    return raw
+
+
+registry.register(
+    name="inspect_ui",
+    toolset="vision",
+    schema=INSPECT_UI_SCHEMA,
+    handler=_handle_inspect_ui,
+    is_async=True,
+    emoji="🎯",
 )
 
 

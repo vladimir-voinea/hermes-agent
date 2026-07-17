@@ -254,6 +254,42 @@ def _resolve_crash_grace_seconds() -> int:
     return DEFAULT_CRASH_GRACE_SECONDS
 
 
+# Grace period between first observing that a worker's task has left
+# ``running`` (done / blocked / cancelled / superseded) and force-killing
+# the worker's still-alive process group. Gives a worker that just called
+# ``kanban_complete`` a window to wind down and exit on its own before the
+# orphan reaper escalates to a group SIGTERM/SIGKILL. A self-completing
+# worker normally exits in well under a second; anything still alive after
+# this window is stuck (or has spawned children that outlived it) and is
+# reaped. See :func:`reap_orphaned_workers`.
+DEFAULT_ORPHAN_REAP_GRACE_SECONDS = 30
+
+# Number of 0.5 s ticks the orphan reaper waits after SIGTERM-ing a stuck
+# worker's process group before escalating to SIGKILL. These workers have
+# already had ``DEFAULT_ORPHAN_REAP_GRACE_SECONDS`` to exit cleanly, so the
+# post-SIGTERM window is deliberately short.
+_ORPHAN_KILL_GRACE_TICKS = 6
+
+
+def _resolve_orphan_reap_grace_seconds() -> int:
+    """Return the orphan-reap grace period in seconds.
+
+    Reads ``HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS`` from the environment;
+    falls back to ``DEFAULT_ORPHAN_REAP_GRACE_SECONDS`` when absent, empty,
+    non-integer, or negative. A value of 0 reaps a lingering worker on the
+    very next tick after its task leaves ``running`` (useful for tests).
+    """
+    raw = os.environ.get("HERMES_KANBAN_ORPHAN_REAP_GRACE_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_ORPHAN_REAP_GRACE_SECONDS
+
+
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """Return the rate-limit requeue cooldown in seconds.
 
@@ -915,6 +951,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Worker runtime that owns this card's attempts. ``"hermes"`` (the
+    # default) spawns a Hermes profile worker; an external runtime id
+    # (e.g. ``"opencode"``) spawns a lifecycle bridge. Null/missing on
+    # legacy rows is equivalent to ``"hermes"`` — see the column comment
+    # in SCHEMA_SQL and ``kanban_worker_runtimes``.
+    worker_runtime: str = "hermes"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -998,6 +1040,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            worker_runtime=(
+                row["worker_runtime"]
+                if "worker_runtime" in keys and row["worker_runtime"]
+                else "hermes"
             ),
         )
 
@@ -1176,7 +1223,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Worker runtime that owns this card's attempts. 'hermes' (the
+    -- default) spawns a Hermes profile worker; an external runtime id
+    -- (e.g. 'opencode') spawns a lifecycle bridge that runs the external
+    -- agent and writes board state back via this kernel. NULL/missing on
+    -- legacy rows is equivalent to 'hermes' — no migration surprise for
+    -- existing boards. Validated at write time against the runtime
+    -- registry (see hermes_cli.kanban_worker_runtimes).
+    worker_runtime       TEXT NOT NULL DEFAULT 'hermes'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1264,6 +1319,27 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Live worker OS-process registry, keyed by pid. Written when the
+-- dispatcher spawns a worker and cleared when the reaper confirms the
+-- process group is gone. Deliberately decoupled from ``tasks.worker_pid``
+-- (which is NULLed the instant a task leaves ``running``): a worker that
+-- keeps running after its task is done / blocked / cancelled — or is
+-- superseded by a re-spawn — would otherwise be invisible to every reaper
+-- and keep hammering the model. ``pgid`` is the worker's process-group id
+-- (== pid at spawn, since workers start a new session), so the reaper can
+-- signal the whole tree even after the group leader itself has exited.
+-- ``orphaned_at`` is stamped the first tick the worker is seen to have
+-- outlived its task, arming the grace window before a forced group kill.
+CREATE TABLE IF NOT EXISTS worker_procs (
+    pid           INTEGER PRIMARY KEY,
+    pgid          INTEGER NOT NULL,
+    task_id       TEXT NOT NULL,
+    run_id        INTEGER,
+    claim_lock    TEXT,
+    registered_at INTEGER NOT NULL,
+    orphaned_at   INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1274,6 +1350,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_worker_procs_task      ON worker_procs(task_id);
 """
 
 
@@ -1987,6 +2064,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "worker_runtime" not in cols:
+        # Pluggable worker runtime. Existing rows default to 'hermes',
+        # preserving the behaviour they had before the column existed
+        # (every card spawned a Hermes profile worker). NOT NULL DEFAULT
+        # 'hermes' on the fresh-schema path; the additive ALTER below uses
+        # the same default for legacy rows.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "worker_runtime",
+            "worker_runtime TEXT NOT NULL DEFAULT 'hermes'",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2408,6 +2498,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    worker_runtime: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2448,6 +2539,29 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    # Validate + normalise the worker runtime. Unknown ids and known-but-
+    # disabled runtimes are rejected at write time so a card never sits in
+    # ``ready`` waiting for a runtime that can never spawn on this host.
+    # ``None``/empty falls through to ``hermes`` (zero migration).
+    from hermes_cli import kanban_worker_runtimes as _runtimes
+    runtime_id = _runtimes.validate_runtime(worker_runtime)
+    runtime_info = _runtimes.get_runtime(runtime_id)
+    # Hermes-only feature flags have no meaning on an external runtime.
+    # Reject (fail closed) with a clear message naming the offending flag
+    # so the caller stops pretending the runtime has capabilities it lacks.
+    if runtime_info is not None and runtime_info.unsupported_flags:
+        if goal_mode and "goal_mode" in runtime_info.unsupported_flags:
+            raise ValueError(
+                f"goal_mode is a Hermes-only feature and is not supported "
+                f"by the {runtime_id!r} worker runtime"
+            )
+    # External runtimes may omit the assignee (displayed as the runtime id);
+    # Hermes-native runtimes keep requiring a real profile assignee, gated
+    # by profile_exists in the dispatcher as before. We do NOT add a
+    # create-time profile_exists check for hermes — that would be a new
+    # restriction on existing fleet behaviour and the dispatcher already
+    # buckets non-profile assignees as nonspawnable.
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2536,6 +2650,20 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+
+    # Hermes-only ``skills`` force-load has no meaning on an external
+    # runtime (the bridge runs the external agent, which has no Hermes
+    # skill loader). Reject with a clear message rather than silently
+    # dropping the request — same fail-closed policy as goal_mode above.
+    if (
+        skills_list
+        and runtime_info is not None
+        and "skills" in runtime_info.unsupported_flags
+    ):
+        raise ValueError(
+            f"--skills is a Hermes-only feature and is not supported "
+            f"by the {runtime_id!r} worker runtime"
+        )
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -2636,8 +2764,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        worker_runtime
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2660,6 +2789,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        runtime_id,
                     ),
                 )
                 for pid in parents:
@@ -2679,6 +2809,7 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "worker_runtime": runtime_id,
                     },
                 )
             return task_id
@@ -2805,6 +2936,44 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
         return True
+
+
+def set_worker_runtime(
+    conn: sqlite3.Connection, task_id: str, runtime: Optional[str]
+) -> str:
+    """Change a task's worker runtime (dashboard/CLI edit path).
+
+    Validates ``runtime`` through the same registry path as
+    :func:`create_task` (unknown / disabled runtimes rejected with a clear
+    error) and refuses to change a task that is currently running — the
+    in-flight attempt was spawned under the old runtime and must finish
+    first. Returns the normalised runtime id that was written.
+    """
+    from hermes_cli import kanban_worker_runtimes as _runtimes
+    runtime_id = _runtimes.validate_runtime(runtime)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_runtime FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"unknown task: {task_id}")
+        if row["claim_lock"] is not None and row["status"] == "running":
+            raise RuntimeError(
+                f"cannot change runtime of {task_id}: currently running "
+                "(claimed). Wait for completion or reclaim the stale lock first."
+            )
+        prev = row["worker_runtime"] if row["worker_runtime"] else "hermes"
+        if prev != runtime_id:
+            conn.execute(
+                "UPDATE tasks SET worker_runtime = ? WHERE id = ?",
+                (runtime_id, task_id),
+            )
+            _append_event(
+                conn, task_id, "runtime_changed",
+                {"from": prev, "to": runtime_id},
+            )
+        return runtime_id
 
 
 # ---------------------------------------------------------------------------
@@ -6055,6 +6224,12 @@ class DispatchResult:
     "task is genuinely stuck"."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
+    reaped_orphans: list[int] = field(default_factory=list)
+    """PIDs of worker processes force-killed because they kept running after
+    their task left ``running`` (done / blocked / superseded). Empty on a
+    healthy board; non-empty means the orphan reaper caught a worker that
+    would otherwise have kept hammering the model. See
+    :func:`reap_orphaned_workers`."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -6247,6 +6422,87 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _default_worker_signal(target: int, sig: int) -> None:
+    """Deliver ``sig`` to a dispatcher worker's whole process group.
+
+    This is the real-runtime default behind every worker-termination path
+    (``signal_fn`` stays the ``(target, sig)`` test seam). Workers are
+    spawned with ``start_new_session=True``, so each worker leads its own
+    process group whose id equals the worker pid. Signalling the *group*
+    (``os.killpg``) instead of just the leader pid is what reaches the
+    children the worker spawned — nested tool subprocesses, the process
+    actually streaming from the model — so a terminated worker cannot leave
+    orphaned descendants that get reparented to init and keep hammering the
+    provider. That orphaning is exactly why a leader-only SIGTERM appeared
+    to "not kill" a finished task before.
+
+    ``target`` may be a live leader pid or a bare pgid (the leader can be
+    gone while children live on): ``os.getpgid`` resolves the group when
+    the leader is alive, and falls back to ``target`` itself otherwise —
+    correct because a start-new-session leader's pid *is* its pgid. Degrades
+    to a plain ``os.kill`` on Windows (no process groups) or when the group
+    cannot be resolved.
+    """
+    itarget = int(target)
+    if _IS_WINDOWS or not hasattr(os, "killpg"):
+        os.kill(itarget, sig)
+        return
+    try:
+        pgid = os.getpgid(itarget)
+    except (ProcessLookupError, OSError):
+        # Leader already reaped; it led its own group, so its pid doubles
+        # as the pgid for any surviving children.
+        pgid = itarget
+    # Never signal pgid 0 ("every process in the caller's group") or the
+    # dispatcher's own group — a recycled pid must not take down the
+    # gateway/dispatcher that hosts this reaper.
+    try:
+        own_pgid = os.getpgrp()
+    except OSError:
+        own_pgid = -1
+    if pgid <= 0 or pgid == own_pgid:
+        os.kill(itarget, sig)
+        return
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        # Whole group already gone — nothing to do.
+        pass
+    except OSError:
+        # killpg refused (e.g. EPERM) — fall back to the lone leader pid.
+        try:
+            os.kill(itarget, sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _process_group_alive(pgid: Optional[int]) -> bool:
+    """Return True if any process still belongs to process group ``pgid``.
+
+    Uses ``killpg(pgid, 0)``: ``ProcessLookupError`` (ESRCH) means the group
+    is empty — every member, leader and children, has exited — so the worker
+    tree is truly gone. ``PermissionError`` (EPERM) means members exist that
+    we may not signal, which still counts as alive. This is what lets the
+    orphan reaper detect a worker whose *leader* already exited but whose
+    children are still running: the group id stays reserved by the kernel as
+    long as any member lives, so a bare leader-pid liveness check would
+    wrongly report the tree dead. Falls back to a pid check on Windows.
+    """
+    if not pgid or pgid <= 0:
+        return False
+    if _IS_WINDOWS or not hasattr(os, "killpg"):
+        return _pid_alive(pgid)
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -6271,8 +6527,12 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
+    # Default to a process-GROUP signal so the worker's children die with
+    # it — a leader-only SIGTERM leaves orphaned descendants that keep
+    # hammering the model. ``signal_fn`` stays the ``(target, sig)`` test
+    # seam. See :func:`_default_worker_signal`.
     kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
+        _default_worker_signal if hasattr(os, "kill") else None
     )
     if kill is None:
         return info
@@ -6466,8 +6726,11 @@ def enforce_max_runtime(
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
         killed = False
+        # Process-GROUP signal by default so a timed-out worker's children
+        # go down with it (see :func:`_default_worker_signal`); ``signal_fn``
+        # is the ``(target, sig)`` test seam.
         kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+            _default_worker_signal if hasattr(os, "kill") else None
         )
         if kill is not None:
             try:
@@ -7019,6 +7282,175 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _terminate_worker_group(pgid: int, *, signal_fn=None) -> bool:
+    """SIGTERM, then (after a short grace) SIGKILL, an entire worker group.
+
+    Returns True when the process group is empty afterward. ``signal_fn`` is
+    the ``(target, sig)`` test seam; the real default is
+    :func:`_default_worker_signal`, which routes to ``os.killpg`` so every
+    process in the group dies — the leader *and* the children that would
+    otherwise be orphaned and keep hammering the provider. The SIGTERM →
+    SIGKILL escalation is what guarantees death even for a worker that
+    ignores (or is too wedged to handle) SIGTERM: the exact failure the
+    operator hit when only a manual SIGKILL cleared a "finished" task.
+    """
+    import signal as _signal
+    kill = signal_fn if signal_fn is not None else (
+        _default_worker_signal if hasattr(os, "kill") else None
+    )
+    if kill is None:
+        return not _process_group_alive(pgid)
+    try:
+        kill(int(pgid), _signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return not _process_group_alive(pgid)
+    for _ in range(max(1, _ORPHAN_KILL_GRACE_TICKS)):
+        if not _process_group_alive(pgid):
+            return True
+        time.sleep(0.5)
+    if _process_group_alive(pgid):
+        try:
+            _sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+            kill(int(pgid), _sigkill)
+        except (ProcessLookupError, OSError):
+            pass
+    return not _process_group_alive(pgid)
+
+
+def reap_orphaned_workers(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> list[int]:
+    """Kill worker processes that have outlived their task.
+
+    The gap this closes: ``complete_task`` / ``block_task`` / ``_end_run``
+    NULL ``tasks.worker_pid`` the instant a task leaves ``running``, so a
+    worker that keeps running after that — because it self-completed but
+    didn't exit, was completed out from under itself by the CLI/dashboard,
+    or was superseded by a re-spawn — is invisible to every other reaper
+    (:func:`detect_crashed_workers`, :func:`enforce_max_runtime`,
+    :func:`detect_stale_running` all key off ``status='running' AND
+    worker_pid IS NOT NULL``). Such a worker keeps hammering the model
+    forever. This reaper tracks workers in the durable ``worker_procs``
+    registry instead, independently of task status.
+
+    Each tick, for every host-local registered worker:
+
+    * **Group already empty** → the worker (and its children) exited; drop
+      the registry row.
+    * **Still the live worker of a running task** → healthy; leave it (and
+      clear any stale orphan stamp).
+    * **Otherwise (orphan)** → stamp ``orphaned_at`` on first sighting to
+      arm a grace window (a just-completed worker gets a moment to exit on
+      its own), then once the window elapses force the whole process group
+      down with SIGTERM→SIGKILL and drop the row.
+
+    Whole-*group* liveness (:func:`_process_group_alive`) — not a bare
+    leader-pid check — is used throughout so a worker whose leader already
+    exited but whose children survive is still detected and reaped. Runs
+    host-local (same single-host reasoning as the other reapers): only
+    workers whose ``claim_lock`` names this host are candidates. Returns the
+    pids reaped this tick.
+    """
+    reaped: list[int] = []
+    try:
+        rows = conn.execute(
+            "SELECT pid, pgid, task_id, claim_lock, orphaned_at "
+            "FROM worker_procs"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # ``worker_procs`` absent (a pre-migration DB opened by an older
+        # process that predates this table). Nothing to reap; the table is
+        # created on the next init/restart.
+        return reaped
+    if not rows:
+        return reaped
+
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    grace = _resolve_orphan_reap_grace_seconds()
+    now = int(time.time())
+
+    for row in rows:
+        pid = int(row["pid"])
+        pgid = int(row["pgid"]) if row["pgid"] is not None else pid
+        lock = row["claim_lock"] or ""
+
+        # Only manage workers this host spawned. A foreign (or empty)
+        # claim_lock means we can't meaningfully signal the process; leave
+        # the row for the owning host's dispatcher rather than guess.
+        if not lock.startswith(host_prefix):
+            continue
+
+        # Whole-group liveness: catches the "leader exited, children still
+        # running" orphan that a leader-pid check would miss.
+        if not _process_group_alive(pgid):
+            _deregister_worker_proc(conn, pid)
+            continue
+
+        trow = conn.execute(
+            "SELECT status, worker_pid FROM tasks WHERE id = ?",
+            (row["task_id"],),
+        ).fetchone()
+        still_active = (
+            trow is not None
+            and trow["status"] == "running"
+            and trow["worker_pid"] is not None
+            and int(trow["worker_pid"]) == pid
+        )
+        if still_active:
+            # Healthy in-flight worker. Clear any stale orphan stamp left by
+            # a transient blip (e.g. a task that bounced back to running
+            # under the same pid).
+            if row["orphaned_at"] is not None:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE worker_procs SET orphaned_at = NULL "
+                        "WHERE pid = ?",
+                        (pid,),
+                    )
+            continue
+
+        # Orphan: task is done / blocked / gone, or this pid was superseded
+        # by a re-spawn. Arm the grace window on first sighting.
+        orphaned_at = row["orphaned_at"]
+        if orphaned_at is None:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE worker_procs SET orphaned_at = ? "
+                    "WHERE pid = ? AND orphaned_at IS NULL",
+                    (now, pid),
+                )
+            if grace > 0:
+                continue  # give the worker the grace window to self-exit
+            orphaned_at = now
+        if now - int(orphaned_at) < grace:
+            continue
+
+        # Grace elapsed and still alive → force the whole tree down.
+        killed = _terminate_worker_group(pgid, signal_fn=signal_fn)
+        if trow is not None:
+            # Leave an audit trail on the task so `hermes kanban tail` shows
+            # why the process was killed. Skipped when the task row is gone.
+            with write_txn(conn):
+                _append_event(
+                    conn, row["task_id"], "orphan_reaped",
+                    {
+                        "pid": pid,
+                        "pgid": pgid,
+                        "task_status": trow["status"],
+                        "orphaned_for_seconds": now - int(orphaned_at),
+                        "killed": bool(killed),
+                    },
+                )
+        _deregister_worker_proc(conn, pid)
+        reaped.append(pid)
+
+    return reaped
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7207,6 +7639,10 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
+
+    Also registers the process in ``worker_procs`` (keyed by pid) so it can
+    be reaped later even after ``tasks.worker_pid`` is NULLed by a terminal
+    transition. See :func:`reap_orphaned_workers`.
     """
     with write_txn(conn):
         conn.execute(
@@ -7220,6 +7656,46 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _register_worker_proc(conn, task_id, int(pid), run_id)
+
+
+def _register_worker_proc(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    run_id: Optional[int],
+) -> None:
+    """Record a live worker process in the ``worker_procs`` registry.
+
+    Must be called inside an open ``write_txn`` (``_set_worker_pid`` already
+    holds one). The worker is spawned with ``start_new_session=True``, so its
+    process-group id equals its pid at spawn time; we store that as ``pgid``
+    so the reaper can signal the whole tree even after the leader exits. The
+    task's current ``claim_lock`` is captured for host-local gating in the
+    reaper. Keyed by pid with ``INSERT OR REPLACE`` so a recycled pid can
+    never leave a stale row behind.
+    """
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT claim_lock FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    claim_lock = row["claim_lock"] if row is not None else None
+    conn.execute(
+        "INSERT OR REPLACE INTO worker_procs "
+        "(pid, pgid, task_id, run_id, claim_lock, registered_at, orphaned_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        (int(pid), int(pid), task_id, run_id, claim_lock, now),
+    )
+
+
+def _deregister_worker_proc(conn: sqlite3.Connection, pid: int) -> None:
+    """Drop a worker's ``worker_procs`` row (its own ``write_txn``).
+
+    Called when the reaper confirms a worker's process group is gone
+    (clean exit) or after it force-kills a stuck orphan.
+    """
+    with write_txn(conn):
+        conn.execute("DELETE FROM worker_procs WHERE pid = ?", (int(pid),))
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7571,6 +8047,12 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Reap workers that kept running after their task left ``running`` — the
+    # done/blocked/superseded orphans that NULLed ``tasks.worker_pid`` hides
+    # from every status-keyed reaper above. Kills the whole process group so
+    # orphaned children die too. See reap_orphaned_workers() for the full
+    # rationale.
+    result.reaped_orphans = reap_orphaned_workers(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -7589,7 +8071,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, worker_runtime FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7648,18 +8130,29 @@ def _dispatch_once_locked(
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
+        # External runtimes (e.g. opencode) do not run a Hermes profile:
+        # they skip the profile_exists gate and may omit the assignee
+        # entirely (displayed as the runtime id). Hermes-native runtimes
+        # keep requiring a real profile assignee.
+        row_external = _is_external_runtime(row["worker_runtime"])
         if not row_assignee:
-            # Honour kanban.default_assignee: when the dispatcher hits an
-            # unassigned ready task and an operator-configured fallback
-            # exists, persist the assignment and proceed. This removes the
-            # dashboard footgun where a task created without an assignee
-            # parks in 'ready' forever even though the operator's intent
-            # ("default") was perfectly clear (#27145). Mutating the row
-            # (not just the in-memory view) keeps diagnostics and the
-            # board state consistent: the task is now legitimately owned
-            # by ``kanban.default_assignee``, not "unassigned but secretly
-            # routed".
-            if _default_assignee and _default_assignee_resolved:
+            if row_external:
+                # External runtime with no assignee: use the runtime id as
+                # the per-profile tracking key so the concurrency cap and
+                # spawn result still have a non-empty owner. The task is
+                # NOT skipped — external workers don't need a profile.
+                row_assignee = row["worker_runtime"]
+            elif _default_assignee and _default_assignee_resolved:
+                # Honour kanban.default_assignee: when the dispatcher hits an
+                # unassigned ready task and an operator-configured fallback
+                # exists, persist the assignment and proceed. This removes the
+                # dashboard footgun where a task created without an assignee
+                # parks in 'ready' forever even though the operator's intent
+                # ("default") was perfectly clear (#27145). Mutating the row
+                # (not just the in-memory view) keeps diagnostics and the
+                # board state consistent: the task is now legitimately owned
+                # by ``kanban.default_assignee``, not "unassigned but secretly
+                # routed".
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
                 # 'assigned' event so the board state matches what just happened.
@@ -7701,19 +8194,24 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
-            continue
+        #
+        # External runtimes are exempt: they spawn a lifecycle bridge,
+        # not ``hermes -p <profile>``, so the profile_exists gate does
+        # not apply.
+        if not row_external:
+            try:
+                from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+            except Exception:
+                profile_exists = None  # type: ignore[assignment]
+            if profile_exists is not None and not profile_exists(row_assignee):
+                # Bucket separately from skipped_unassigned: the operator
+                # cannot fix this by assigning a profile (the assignee IS the
+                # intended owner — a terminal lane). Health telemetry uses
+                # this distinction to suppress spurious "stuck" warnings on
+                # multi-lane setups where the ready queue is steadily full
+                # of human-pulled work.
+                result.skipped_nonspawnable.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -7781,8 +8279,18 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        # Resolve the spawn function: an explicit ``spawn_fn`` override
+        # wins (back-compat with test stubs); otherwise the spawn-time
+        # registry selects the adapter for this task's worker_runtime
+        # (default ``hermes`` → ``_default_spawn``). The resolution is
+        # inside the try/except below so an unregistered runtime (e.g.
+        # opencode before its bridge adapter ships) records a counted
+        # spawn failure rather than crashing the tick.
         try:
+            if spawn_fn is not None:
+                _spawn = spawn_fn
+            else:
+                _spawn = resolve_spawn_adapter(claimed.worker_runtime).spawn
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
@@ -7879,8 +8387,11 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
+            if spawn_fn is not None:
+                _spawn = spawn_fn
+            else:
+                _spawn = resolve_spawn_adapter(claimed.worker_runtime).spawn
             import inspect
             try:
                 sig = inspect.signature(_spawn)
@@ -8275,6 +8786,15 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # A worker's role="user" turns are the ORCHESTRATOR's task prompt, not a
+    # human's — there is no user in this process. Memory providers gate fact
+    # writes on agent_context (MemoryProvider.initialize), so tag the child
+    # honestly: without this it defaults to "primary" and the extractor mines
+    # machine-generated task text into durable "user facts" ("The user is
+    # working on kanban task t_6e338e52"). Session summaries are still allowed
+    # for contexts a provider opts into via its activity_log_contexts.
+    env["HERMES_AGENT_CONTEXT"] = "worker"
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -8353,6 +8873,192 @@ def _default_spawn(
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
     return proc.pid
+
+
+# ---------------------------------------------------------------------------
+# Spawn-time worker runtime registry
+# ---------------------------------------------------------------------------
+#
+# The *write-time* registry (known runtimes, enabled check, assignee rules)
+# lives in ``kanban_worker_runtimes``. This is its spawn-time counterpart:
+# it maps a runtime name to the spawn adapter the dispatcher invokes.
+#
+# An adapter is a thin struct holding the runtime name, whether it is
+# *external* (skips the Hermes ``profile_exists`` gate and may omit an
+# assignee), and the ``spawn(task, workspace, *, board=None) -> pid``
+# callable. The Hermes adapter wraps :func:`_default_spawn`; a later
+# OpenCode adapter (ticket 03) will wrap the lifecycle bridge. Adding a
+# runtime is a single :func:`register_spawn_adapter` call — no dispatcher
+# change, no schema change.
+
+@dataclass(frozen=True)
+class SpawnAdapter:
+    """Spawn-time adapter for one worker runtime.
+
+    ``spawn`` has the same signature as :func:`_default_spawn`:
+    ``spawn(task, workspace, *, board=None) -> Optional[int]``.
+    """
+
+    name: str
+    external: bool
+    spawn: Any  # Callable[[Task, str], Optional[int]] with optional board kw
+
+
+_SPAWN_ADAPTERS: dict[str, SpawnAdapter] = {}
+
+
+def register_spawn_adapter(adapter: SpawnAdapter) -> None:
+    """Register (or replace) the spawn adapter for a runtime name."""
+    _SPAWN_ADAPTERS[adapter.name] = adapter
+
+
+def unregister_spawn_adapter(name: str) -> None:
+    """Remove a spawn adapter (test helper / teardown)."""
+    _SPAWN_ADAPTERS.pop(name, None)
+
+
+def resolve_spawn_adapter(runtime: Optional[str]) -> SpawnAdapter:
+    """Return the spawn adapter for ``runtime`` (default ``hermes``).
+
+    Raises ``ValueError`` for unknown runtimes so the dispatcher's spawn
+    failure path records a counted failure (circuit breaker) rather than
+    silently no-op'ing a card that can never spawn.
+    """
+    from hermes_cli.kanban_worker_runtimes import normalize_runtime
+
+    normalised = normalize_runtime(runtime)
+    adapter = _SPAWN_ADAPTERS.get(normalised)
+    if adapter is None:
+        raise ValueError(
+            f"unknown worker runtime {normalised!r}; no spawn adapter "
+            f"registered (registered: {', '.join(sorted(_SPAWN_ADAPTERS)) or 'none'})"
+        )
+    return adapter
+
+
+def _is_external_runtime(runtime: Optional[str]) -> bool:
+    """True iff ``runtime`` is a registered external (non-Hermes) runtime."""
+    from hermes_cli.kanban_worker_runtimes import is_external_runtime
+
+    return is_external_runtime(runtime)
+
+
+def _opencode_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn the OpenCode lifecycle bridge; return its PID.
+
+    OpenCode has no kanban tools, so we do NOT exec ``opencode run`` here: the
+    dispatcher would watch a PID that exits without ever resolving its card,
+    and the card would be re-run forever. The PID we return is
+    :mod:`hermes_cli.kanban_opencode_bridge`, which runs OpenCode and then
+    closes the card from the outside. See that module for why it also fires
+    the host's ``kanban_complete`` hooks.
+
+    The env contract is deliberately the same one :func:`_default_spawn`
+    builds — same board pins, same workspace pins, same log file. A worker
+    runtime should be a swap of *who does the work*, not of how the board
+    talks to it.
+    """
+    import subprocess
+
+    env = dict(os.environ)
+
+    # An external runtime may have no assignee (the create path allows it).
+    # When it does have one, honour it: the profile decides which hooks the
+    # bridge's completion gate will fire, so `tech` gets tech's guards.
+    if task.assignee:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile_arg = normalize_profile_name(task.assignee)
+        try:
+            env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        except FileNotFoundError:
+            pass
+        env["HERMES_PROFILE"] = profile_arg
+
+    if task.tenant:
+        env["HERMES_TENANT"] = task.tenant
+    env["HERMES_KANBAN_TASK"] = task.id
+    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+        env["TERMINAL_CWD"] = workspace
+    if task.branch_name:
+        env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    if task.current_run_id is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if task.claim_lock:
+        env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    env["HERMES_KANBAN_BOARD"] = _normalize_board_slug(board) or get_current_board()
+    env["HERMES_AGENT_CONTEXT"] = "worker"
+    # The bridge has no TTY to approve a shell hook at — same reason the Hermes
+    # worker is spawned with `--accept-hooks`. Without this its completion gate
+    # silently registers nothing and allows everything.
+    env["HERMES_ACCEPT_HOOKS"] = "1"
+    env.pop("HERMES_TUI", None)
+
+    # ★ Resolve the runtime here, in the process that already decided this
+    #   runtime is spawnable, and hand the answer down. The bridge runs with
+    #   HERMES_HOME pointing at the ASSIGNEE'S PROFILE, and Hermes profiles do
+    #   not inherit config — they merge onto DEFAULT_CONFIG, never onto the
+    #   root's. So a bridge left to re-read `kanban.runtimes.opencode` itself
+    #   reads a different file than the dispatcher did and can disagree with
+    #   it: the card validates and spawns, then dies with "binary not found"
+    #   because the profile's config never had the path. Where the binary lives
+    #   is a fact about the host, not about the profile.
+    from hermes_cli.kanban_worker_runtimes import _resolve_command, _runtime_config
+
+    resolved = _resolve_command("opencode")
+    if resolved:
+        env["HERMES_OPENCODE_COMMAND"] = resolved
+    _cfg = _runtime_config("opencode")
+    if _cfg.get("default_model"):
+        env["HERMES_OPENCODE_MODEL"] = str(_cfg["default_model"])
+    if _cfg.get("extra_args"):
+        env["HERMES_OPENCODE_EXTRA_ARGS"] = json.dumps(_cfg["extra_args"])
+
+    cmd = [sys.executable, "-m", "hermes_cli.kanban_opencode_bridge"]
+
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{task.id}.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+            cmd,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except Exception:
+        log_f.close()
+        raise
+    # As in _default_spawn: the child inherits the FD and keeps writing after
+    # we return, so we must not close it here.
+    return proc.pid
+
+
+# Register the Hermes adapter — the historic spawn path. Done at import
+# time so the dispatcher always has a default. ``_default_spawn`` is
+# defined above, so the reference is stable.
+register_spawn_adapter(
+    SpawnAdapter(name="hermes", external=False, spawn=_default_spawn)
+)
+register_spawn_adapter(
+    SpawnAdapter(name="opencode", external=True, spawn=_opencode_spawn)
+)
 
 
 # ---------------------------------------------------------------------------

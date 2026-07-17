@@ -1015,6 +1015,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
+            reasoning_control=getattr(agent, "_reasoning_control", None),
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
@@ -1047,6 +1048,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
+        reasoning_control=getattr(agent, "_reasoning_control", None),
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),
@@ -2499,6 +2501,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             entry["function"]["name"] = tc_delta.function.name
                         if tc_delta.function.arguments:
                             entry["function"]["arguments"] += tc_delta.function.arguments
+                            # Live-stream the growing arguments JSON to the display
+                            # so a big write_file payload renders in real time
+                            # instead of freezing on a spinner.  Carries the full
+                            # accumulation; the display emits only the new portion.
+                            agent._fire_tool_args_delta(
+                                idx,
+                                entry["function"]["name"],
+                                entry["function"]["arguments"],
+                            )
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")

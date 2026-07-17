@@ -1159,6 +1159,18 @@ DEFAULT_CONFIG = {
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
+        # How /voice recordings are presented to the main model.
+        #   "auto"   — send the raw WAV as a native input_audio content part
+        #              when the active model reports supports_audio_input=True
+        #              (config override or models.dev metadata); otherwise
+        #              transcribe with STT and send text (the historical path).
+        #   "native" — always attach the WAV natively; audio-blind models will
+        #              error at the provider (recovered by stripping audio).
+        #   "stt"    — always transcribe; the model never hears the audio.
+        # STT remains the default and the fallback whenever native attachment
+        # can't be built (unreadable WAV, mode re-check on the turn-resolved
+        # model says no).
+        "audio_input_mode": "auto",
         "disabled_toolsets": [],
 
         # Per-model reasoning effort overrides (spelling-tolerant).
@@ -1592,6 +1604,25 @@ DEFAULT_CONFIG = {
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
+        },
+        # UI-specialized vision task, distinct from `vision` above. Backs the
+        # `inspect_ui` tool: routes UI screenshots to a GUI-grounding model
+        # (Holo) that returns element locations/coordinates + layout/state,
+        # rather than general image description. Treated as a first-class
+        # vision task by the router (see auxiliary_client._is_vision_task), so
+        # it gets the same vision-client handling as `vision`. Default endpoint
+        # is the home cluster's Holo-4B on gpu1 (no-think :8081 — grounding
+        # wants deterministic coordinates, not chain-of-thought); flip base_url
+        # to :8080 for the thinking variant or to the dgx2 35B for harder UI
+        # reasoning.
+        "inspect_ui": {
+            "provider": "custom",
+            "model": "holo-4b",
+            "base_url": "http://192.168.1.45:8081/v1",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {},
+            "download_timeout": 30,
         },
         "web_extract": {
             "provider": "auto",
@@ -4907,7 +4938,7 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
-        "ssl_ca_cert", "ssl_verify",
+        "ssl_ca_cert", "ssl_verify", "reasoning_control",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -5032,6 +5063,13 @@ def _normalize_custom_provider_entry(
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
 
+    # Per-provider reasoning lever: maps Hermes' /reasoning (none/effort)
+    # onto this engine's native knobs (chat_template_kwargs.enable_thinking +
+    # top-level reasoning_effort). See agent_init._custom_provider_reasoning_control_for_agent.
+    reasoning_control = entry.get("reasoning_control")
+    if isinstance(reasoning_control, dict) and reasoning_control:
+        normalized["reasoning_control"] = dict(reasoning_control)
+
     # Per-provider extra HTTP headers (proxies, gateways, custom auth).
     # Values may carry credentials (e.g. CF-Access-Client-Secret) — never
     # log them anywhere downstream.
@@ -5077,6 +5115,7 @@ def _custom_provider_entry_to_provider_config(
         "discover_models",
         "extra_body",
         "extra_headers",
+        "reasoning_control",
         "ssl_ca_cert",
         "ssl_verify",
     ):

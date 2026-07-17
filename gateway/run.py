@@ -1469,6 +1469,90 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_hermes_home_override(home_token)
 
 
+# Profile homes whose plugin + shell-hook runtime has been set up in this
+# process (normalized paths). Guarded by the lock; membership makes
+# _ensure_profile_plugin_runtime an idempotent no-op, so it is safe to call
+# from the per-turn path (worker threads included).
+_profile_plugin_runtime_ready: set = set()
+_profile_plugin_runtime_lock = threading.Lock()
+
+
+def _ensure_profile_plugin_runtime(profile_home: "Path") -> None:
+    """Discover plugins and register shell hooks for one profile, once.
+
+    The multiplexed gateway scopes each routed turn's config/skills/secrets
+    via ``_profile_runtime_scope``, but plugin discovery and shell-hook
+    registration are process-level acts: they populate the profile's own
+    PluginManager (see ``hermes_cli.plugins.get_plugin_manager``), which the
+    turn's hook/tool lookups then resolve through the same home override.
+    Without this, a routed turn gets the profile's model/config but NEITHER
+    its plugins NOR its ``pre_tool_call`` guards — the guards silently never
+    fire (issue this function exists to fix).
+
+    Idempotent per profile home and thread-safe. No-op when multiplexing is
+    off, and for the process's own base home (the default profile), which the
+    normal gateway startup path already sets up. Failures are logged at
+    WARNING — a guard that silently fails to register is the exact bug this
+    prevents — but never propagate: a broken profile must not take down the
+    gateway or wedge the turn.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+        if not is_multiplex_active():
+            return
+    except Exception:
+        return
+
+    try:
+        key = os.path.realpath(os.path.expanduser(str(profile_home)))
+    except (OSError, ValueError):
+        key = str(profile_home)
+
+    if key in _profile_plugin_runtime_ready:
+        return
+    with _profile_plugin_runtime_lock:
+        if key in _profile_plugin_runtime_ready:
+            return
+        try:
+            with _profile_runtime_scope(Path(profile_home)):
+                from hermes_cli.plugins import (
+                    current_profile_scope_key,
+                    discover_plugins,
+                )
+
+                if current_profile_scope_key() is None:
+                    # Base home (default profile) — handled by the normal
+                    # startup path; never re-scope the root manager here.
+                    _profile_plugin_runtime_ready.add(key)
+                    return
+
+                try:
+                    discover_plugins()
+                except Exception:
+                    logger.warning(
+                        "[MULTIPLEX] plugin discovery failed for profile home "
+                        "%s — that profile's plugin tools/commands/hooks will "
+                        "be missing this run", profile_home, exc_info=True,
+                    )
+                try:
+                    from hermes_cli.config import load_config
+                    from agent.shell_hooks import register_from_config
+
+                    register_from_config(load_config(), accept_hooks=False)
+                except Exception:
+                    logger.warning(
+                        "[MULTIPLEX] shell-hook registration failed for "
+                        "profile home %s — that profile's configured hooks "
+                        "WILL NOT fire this run", profile_home, exc_info=True,
+                    )
+        except Exception:
+            logger.warning(
+                "[MULTIPLEX] profile plugin/hook runtime setup failed for %s",
+                profile_home, exc_info=True,
+            )
+        _profile_plugin_runtime_ready.add(key)
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner.
 
@@ -3041,6 +3125,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # preserve the queue.
         self._queued_events: Dict[str, List[MessageEvent]] = {}
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
+        # Parallel to native images: cached audio paths buffered for native
+        # ``input_audio`` attachment when the turn's model is audio-capable
+        # (see agent/audio_routing.py). Consumed at the run_conversation site.
+        self._pending_native_audio_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
         # Startup restore gate: while restart-interrupted sessions are being
@@ -7153,6 +7241,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=True,
             )
 
+        # Multiplex mode: the two calls above populated the DEFAULT profile's
+        # plugin manager and hooks from the root home. Every OTHER served
+        # profile gets its own manager + hook set, discovered under its own
+        # HERMES_HOME — matching what `hermes -p <name>` does in its own
+        # process. Eager (here, before adapters start) so the first routed
+        # turn doesn't pay discovery in the hot path; the per-turn
+        # _ensure_profile_plugin_runtime call in
+        # _resolve_profile_home_for_source stays a cheap idempotent no-op and
+        # only does real work for profiles created after startup.
+        self._setup_profile_plugin_runtimes()
+
         # Discover and load event hooks
         self.hooks.discover_and_load()
 
@@ -8705,6 +8804,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
 
+    def _setup_profile_plugin_runtimes(self) -> None:
+        """Eagerly set up plugins + shell hooks for every served profile.
+
+        No-op unless ``gateway.multiplex_profiles`` is on. Runs at startup,
+        before adapters connect, so each profile's PluginManager is populated
+        (plugins discovered under its home, shell hooks from its config.yaml
+        registered) by the time its first turn fires. Per-profile failures are
+        contained and logged inside ``_ensure_profile_plugin_runtime`` — one
+        broken profile must not take down the gateway.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+
+            for _profile_name, _profile_home in profiles_to_serve(multiplex=True):
+                _ensure_profile_plugin_runtime(_profile_home)
+        except Exception:
+            logger.warning(
+                "per-profile plugin/hook setup failed at gateway startup — "
+                "secondary profiles may be missing their plugins and hooks",
+                exc_info=True,
+            )
+
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.
 
@@ -10064,6 +10187,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
+        if canonical == "cd":
+            return await self._handle_cd_command(event, _quick_key)
+
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
 
@@ -10397,13 +10523,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
-                    user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
-                    return str(result) if result else None
+                _plugin_cmd = command.replace("_", "-")
+                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    # Resolve AND run the handler under the routed profile's
+                    # scope: each profile's plugin manager registers its own
+                    # commands, and the handler may read profile config/state.
+                    # Single-profile gateways never enter this branch.
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        plugin_handler = get_plugin_command_handler(_plugin_cmd)
+                        if plugin_handler:
+                            user_args = event.get_command_args().strip()
+                            result = plugin_handler(user_args)
+                            if asyncio.iscoroutine(result):
+                                result = await result
+                            return str(result) if result else None
+                else:
+                    plugin_handler = get_plugin_command_handler(_plugin_cmd)
+                    if plugin_handler:
+                        user_args = event.get_command_args().strip()
+                        result = plugin_handler(user_args)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                        return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
 
@@ -10715,6 +10858,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Reset only this session's per-call buffer; other sessions may be
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
+        self._consume_pending_native_audio_paths(session_key)
 
         _is_shared_multi_user = is_shared_multi_user_session(
             source,
@@ -10796,10 +10940,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
             if audio_paths:
-                message_text, _successful_transcripts = await self._enrich_message_with_transcription(
-                    message_text,
-                    audio_paths,
-                )
+                # Route audio like images: when the turn's model natively accepts
+                # audio (audio_input_mode=auto + supports_audio_input, or =native),
+                # buffer the clips for inline input_audio attachment and SKIP STT
+                # so the model hears the real audio. Otherwise transcribe as before.
+                # Falls back to STT on any error — never worse than today.
+                _audio_mode = "stt"
+                try:
+                    _audio_mode = self._decide_audio_input_mode(
+                        source=source,
+                        session_key=session_key,
+                    )
+                except Exception as _amode_exc:
+                    logger.debug("audio_routing: decision failed, using STT — %s", _amode_exc)
+                if _audio_mode == "native":
+                    pending_native_audio = getattr(self, "_pending_native_audio_paths_by_session", None)
+                    if pending_native_audio is None:
+                        pending_native_audio = {}
+                        self._pending_native_audio_paths_by_session = pending_native_audio
+                    pending_native_audio[session_key] = list(audio_paths)
+                    logger.info(
+                        "Audio routing: native (model accepts audio). %d clip(s) will be attached inline.",
+                        len(audio_paths),
+                    )
+                    _successful_transcripts = []
+                else:
+                    message_text, _successful_transcripts = await self._enrich_message_with_transcription(
+                        message_text,
+                        audio_paths,
+                    )
                 # Echo each successful transcript back to the user immediately
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
@@ -11069,6 +11238,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not pending_native:
             return []
         return list(pending_native.pop(session_key, []) or [])
+
+    def _consume_pending_native_audio_paths(self, session_key: str) -> List[str]:
+        pending_native = getattr(self, "_pending_native_audio_paths_by_session", None)
+        if not pending_native:
+            return []
+        return list(pending_native.pop(session_key, []) or [])
+
+    @staticmethod
+    def _transcode_audio_to_wav(src_path: str) -> Optional[str]:
+        """Transcode a cached clip (Telegram voice is Opus/OGG) to 16 kHz mono
+        WAV for native ``input_audio`` attachment. ``build_native_audio_parts``
+        labels the payload ``format: "wav"``, so the bytes must actually be WAV.
+
+        The WAV is written next to the source in the audio cache (``<stem>
+        .native16k.wav``) and reused if already present, so it persists like the
+        cached original — the ``[Audio message attached at: <path>]`` hint stays
+        valid for any tool the model runs on it. Returns the WAV path, or None
+        on failure. ffmpeg is resolved absolutely because the gateway can run
+        under a LaunchAgent with a minimal PATH that excludes Homebrew.
+        """
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        if not src_path or not os.path.isfile(src_path):
+            return None
+        if src_path.lower().endswith(".wav"):
+            return src_path
+        wav_path = os.path.splitext(src_path)[0] + ".native16k.wav"
+        # Reuse an existing transcode when it's at least as new as the source.
+        try:
+            if os.path.isfile(wav_path) and os.path.getmtime(wav_path) >= os.path.getmtime(src_path):
+                return wav_path
+        except OSError:
+            pass
+        ffmpeg = (
+            os.environ.get("FFMPEG_BIN")
+            or _shutil.which("ffmpeg")
+            or next((p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
+                     if os.path.exists(p)), None)
+        )
+        if not ffmpeg:
+            logger.warning("Native audio: ffmpeg not found; cannot transcode %s", src_path)
+            return None
+        try:
+            proc = _subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-i", src_path,
+                 "-ar", "16000", "-ac", "1", wav_path],
+                stderr=_subprocess.PIPE,
+            )
+            if proc.returncode != 0:
+                logger.warning(
+                    "Native audio: ffmpeg transcode failed for %s: %s",
+                    src_path, proc.stderr.decode()[:300],
+                )
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+                return None
+            return wav_path
+        except Exception as exc:
+            logger.warning("Native audio: transcode error for %s — %s", src_path, exc)
+            return None
 
     def _cache_session_source(self, session_key: str, source) -> None:
         if not session_key or source is None:
@@ -12239,6 +12471,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
+
+            # Turn-telemetry footer (TPS + vLLM prefix-cache hit %) — Telegram
+            # only, per telemetry.telegram_footer config (default True).
+            # Computed AFTER the runtime-metadata footer above so the combined
+            # length is what's checked against Telegram's 4096-UTF16-codeunit
+            # limit (format_telegram_footer's default — matches
+            # plugins/platforms/telegram/adapter.py's MAX_MESSAGE_LENGTH);
+            # degrades to omitting the footer (never splits the message) when
+            # it wouldn't fit. Same delivery gates as the runtime footer:
+            # only on a genuinely-final, not-already-streamed, non-silent
+            # response.
+            try:
+                if (
+                    source.platform == Platform.TELEGRAM
+                    and response
+                    and not agent_result.get("already_sent")
+                    and not _intentional_silence
+                ):
+                    from agent.turn_telemetry import (
+                        format_telegram_footer as _format_telemetry_footer,
+                        telemetry_config as _resolve_telemetry_config,
+                    )
+                    from gateway.platforms.base import utf16_len as _utf16_len
+
+                    _telemetry_cfg = _resolve_telemetry_config(_load_gateway_config())
+                    if _telemetry_cfg.get("enabled", True) and _telemetry_cfg.get("telegram_footer", True):
+                        _telemetry_footer = _format_telemetry_footer(
+                            agent_result.get("turn_telemetry"),
+                            current_length=_utf16_len(response),
+                        )
+                        if _telemetry_footer:
+                            response = f"{response}{_telemetry_footer}"
+            except Exception as _telemetry_footer_err:
+                logger.debug("turn_telemetry: footer build failed: %s", _telemetry_footer_err)
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -15526,6 +15792,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except TypeError:
             executor.shutdown(wait=False)
 
+    def _decide_audio_input_mode(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+        user_config: Optional[dict] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> str:
+        """Resolve audio-input routing for the effective model this turn.
+
+        Returns ``"native"`` (attach the raw audio as an ``input_audio`` part
+        on the user turn) or ``"stt"`` (transcribe with the configured STT
+        provider). Mirrors :meth:`_decide_image_input_mode`: gateway sessions
+        can carry a /model override outside config.yaml, so resolve the same
+        per-session runtime bundle the upcoming turn will use rather than only
+        the persisted default model. See agent/audio_routing.py.
+        """
+        try:
+            from agent.audio_routing import decide_audio_input_mode
+            from agent.auxiliary_client import _read_main_model, _read_main_provider
+            from hermes_cli.config import load_config
+
+            cfg = user_config if isinstance(user_config, dict) else load_config()
+            resolved_provider = (provider or "").strip()
+            resolved_model = (model or "").strip()
+
+            needs_session_runtime = not resolved_provider or not resolved_model
+            has_session_identity = source is not None or session_key
+            if needs_session_runtime and has_session_identity:
+                try:
+                    turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
+                        source=source,
+                        session_key=session_key,
+                        user_config=cfg,
+                    )
+                    if not resolved_model and isinstance(turn_model, str):
+                        resolved_model = turn_model.strip()
+                    runtime_provider = runtime_kwargs.get("provider") if isinstance(runtime_kwargs, dict) else None
+                    if not resolved_provider and isinstance(runtime_provider, str):
+                        resolved_provider = runtime_provider.strip()
+                except Exception as exc:
+                    logger.debug(
+                        "audio_routing: session runtime resolution failed, falling back to config — %s",
+                        exc,
+                    )
+
+            if not resolved_provider:
+                resolved_provider = _read_main_provider()
+            if not resolved_model:
+                resolved_model = _read_main_model()
+
+            return decide_audio_input_mode(resolved_provider, resolved_model, cfg)
+        except Exception as exc:
+            logger.debug("audio_routing: decision failed, falling back to STT — %s", exc)
+            return "stt"
+
     def _decide_image_input_mode(
         self,
         *,
@@ -17573,7 +17896,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         config = getattr(self, "config", None)
         if not getattr(config, "multiplex_profiles", False):
             return None
-        routes = getattr(config, "profile_routes", None)
+        # Runtime bindings (`/profile <name>` typed in a chat) are merged with
+        # the static config routes and matched by the same matcher — one answer
+        # to "which profile serves this message", from two sources. Read per
+        # message (mtime-cached) so a binding takes effect on the NEXT message
+        # rather than the next restart, which is the whole point of it.
+        from gateway.profile_bindings import merged_routes
+
+        try:
+            routes = merged_routes(getattr(config, "profile_routes", None))
+        except Exception:
+            logger.warning("profile bindings unreadable; using static routes only",
+                           exc_info=True)
+            routes = getattr(config, "profile_routes", None)
         if not routes:
             return None
         from gateway.profile_routing import match_profile_route
@@ -17643,6 +17978,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(source, "guild_id", None),
                 )
                 return get_hermes_home()
+            # Safety net for profiles created (or bound via /profile) after
+            # gateway startup: make sure this profile's plugins + shell hooks
+            # are registered before the caller enters its runtime scope.
+            # Idempotent set-membership no-op for profiles the startup pass
+            # already covered; self-gated on multiplex being active.
+            _ensure_profile_plugin_runtime(profile_dir)
             return profile_dir
         except Exception:
             # Catch normalization errors, path errors, etc.
@@ -19636,6 +19977,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _run_message = message
                 else:
                     _run_message = message
+
+                # Native audio attachment (parallel to native images): when the
+                # clips were routed native at prep time, attach the real audio as
+                # input_audio part(s) so an audio-capable model hears it instead
+                # of a transcript. Merges with native image parts when both are
+                # present; degrades to whatever _run_message already is on failure.
+                _native_audio = self._consume_pending_native_audio_paths(session_key)
+                if _native_audio:
+                    try:
+                        from agent.audio_routing import build_native_audio_parts
+                        _audio_part_groups: List[List[Dict[str, Any]]] = []
+                        for _apath in _native_audio:
+                            _wav = self._transcode_audio_to_wav(_apath)
+                            if not _wav:
+                                continue
+                            _aparts, _aerr = build_native_audio_parts(
+                                message if isinstance(_run_message, str) else "",
+                                _wav,
+                            )
+                            if _aparts:
+                                _audio_part_groups.append(_aparts)
+                            elif _aerr:
+                                logger.warning("Native audio: %s", _aerr)
+                        if _audio_part_groups:
+                            if isinstance(_run_message, list):
+                                # Already multimodal (native images): append only
+                                # the input_audio parts to avoid a duplicate text.
+                                for _grp in _audio_part_groups:
+                                    _run_message.extend(
+                                        p for p in _grp if p.get("type") == "input_audio"
+                                    )
+                            else:
+                                # Plain-text turn: first group carries text+audio;
+                                # any extra clips add their input_audio parts.
+                                _run_message = list(_audio_part_groups[0])
+                                for _grp in _audio_part_groups[1:]:
+                                    _run_message.extend(
+                                        p for p in _grp if p.get("type") == "input_audio"
+                                    )
+                            logger.info(
+                                "Native audio attachment: %d clip(s) attached inline.",
+                                len(_audio_part_groups),
+                            )
+                    except Exception as _audio_exc:
+                        logger.warning(
+                            "Native audio attachment failed, falling back: %s",
+                            _audio_exc,
+                        )
 
                 _api_run_message = _wrap_current_message_with_observed_context(
                     _run_message,

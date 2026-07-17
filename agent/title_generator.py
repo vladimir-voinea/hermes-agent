@@ -48,6 +48,45 @@ def _title_language() -> str:
         return ""
 
 
+_MEDIA_PLACEHOLDERS = {
+    "input_audio": "[voice message]",
+    "audio": "[voice message]",
+    "audio_url": "[voice message]",
+    "image": "[image]",
+    "image_url": "[image]",
+    "input_image": "[image]",
+    "video": "[video]",
+    "video_url": "[video]",
+    "input_video": "[video]",
+}
+
+
+def _text_only(message) -> str:
+    """Reduce a message (str or multimodal parts-list) to plain text.
+
+    Media parts collapse to short placeholders so a voice-only first turn
+    still produces a sensible title instead of an empty snippet — and the
+    base64 payload never reaches the auxiliary model.
+    """
+    if not message:
+        return ""
+    if isinstance(message, str):
+        return message
+    if isinstance(message, list):
+        pieces = []
+        for part in message:
+            if isinstance(part, str):
+                pieces.append(part)
+            elif isinstance(part, dict):
+                ptype = part.get("type")
+                if ptype == "text":
+                    pieces.append(part.get("text") or "")
+                elif ptype in _MEDIA_PLACEHOLDERS:
+                    pieces.append(_MEDIA_PLACEHOLDERS[ptype])
+        return " ".join(p for p in pieces if p)
+    return str(message)
+
+
 def generate_title(
     user_message: str,
     assistant_response: str,
@@ -66,9 +105,12 @@ def generate_title(
     ``AIAgent._emit_auxiliary_failure`` so the user sees a warning instead
     of silently accumulating untitled sessions.
     """
-    # Truncate long messages to keep the request small
-    user_snippet = user_message[:500] if user_message else ""
-    assistant_snippet = assistant_response[:500] if assistant_response else ""
+    # Truncate long messages to keep the request small. Multimodal turns
+    # (native-audio /voice, images) arrive as a parts-list — slicing a list
+    # keeps whole parts, so the base64 payload used to reach the auxiliary
+    # model verbatim and 400 it. Reduce to text parts first.
+    user_snippet = _text_only(user_message)[:500]
+    assistant_snippet = _text_only(assistant_response)[:500]
 
     language = _title_language()
     prompt = _TITLE_PROMPT_PINNED_LANGUAGE.format(language=language) if language else _TITLE_PROMPT
