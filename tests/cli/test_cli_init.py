@@ -117,17 +117,24 @@ class TestFallbackChainInit:
 
 
 class TestBusyInputMode:
-    def test_default_busy_input_mode_is_interrupt(self):
+    # LOCAL POLICY (diverges from upstream): busy input never interrupts a
+    # running turn unless "interrupt" is set explicitly. Upstream defaults an
+    # unset/unrecognized value to "interrupt"; here both resolve to "steer".
+    def test_default_busy_input_mode_is_steer(self):
         cli = _make_cli()
-        assert cli.busy_input_mode == "interrupt"
+        assert cli.busy_input_mode == "steer"
 
     def test_busy_input_mode_queue_is_honored(self):
         cli = _make_cli(config_overrides={"display": {"busy_input_mode": "queue"}})
         assert cli.busy_input_mode == "queue"
 
-    def test_unknown_busy_input_mode_falls_back_to_interrupt(self):
-        cli = _make_cli(config_overrides={"display": {"busy_input_mode": "bogus"}})
+    def test_explicit_busy_input_mode_interrupt_is_still_honored(self):
+        cli = _make_cli(config_overrides={"display": {"busy_input_mode": "interrupt"}})
         assert cli.busy_input_mode == "interrupt"
+
+    def test_unknown_busy_input_mode_falls_back_to_steer(self):
+        cli = _make_cli(config_overrides={"display": {"busy_input_mode": "bogus"}})
+        assert cli.busy_input_mode == "steer"
 
     def test_queue_command_works_while_busy(self):
         """When agent is running, /queue should still put the prompt in _pending_input."""

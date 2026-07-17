@@ -397,11 +397,16 @@ class _SlashWorker:
 
 
 def _load_busy_input_mode() -> str:
+    """LOCAL PATCH: unset OR unrecognized resolves to "steer", not upstream's
+    "interrupt". _load_cfg reads the raw config.yaml (plus managed overlay) and
+    never merges DEFAULT_CONFIG, so a profile omitting display.busy_input_mode
+    would otherwise silently interrupt here. Explicit "interrupt" still wins.
+    """
     display = _load_cfg().get("display")
     if not isinstance(display, dict):
         display = {}
     raw = str(display.get("busy_input_mode", "") or "").strip().lower()
-    return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
+    return raw if raw in {"queue", "steer", "interrupt"} else "steer"
 
 
 def _notify_session_boundary(

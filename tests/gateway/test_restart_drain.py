@@ -93,7 +93,10 @@ def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, mon
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_INPUT_MODE", raising=False)
 
-    assert gateway_run.GatewayRunner._load_busy_input_mode() == "interrupt"
+    # LOCAL POLICY (upstream: "interrupt"): no config → steer. This loader reads
+    # the raw config.yaml and never sees DEFAULT_CONFIG, so the safe default has
+    # to live here too, or a profile omitting the key interrupts on Telegram.
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "steer"
 
     (tmp_path / "config.yaml").write_text(
         "display:\n  busy_input_mode: queue\n", encoding="utf-8"
@@ -111,9 +114,10 @@ def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, mon
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "steer")
     assert gateway_run.GatewayRunner._load_busy_input_mode() == "steer"
 
-    # Unknown values fall through to the safe default
+    # Unknown values fall through to the safe default — which is "steer" here,
+    # not upstream's "interrupt": a typo must not silently interrupt turns.
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "bogus")
-    assert gateway_run.GatewayRunner._load_busy_input_mode() == "interrupt"
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "steer"
 
 
 def test_load_busy_text_mode_follows_input_mode_and_honors_legacy(tmp_path, monkeypatch):

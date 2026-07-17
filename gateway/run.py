@@ -5132,16 +5132,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _load_busy_input_mode() -> str:
-        """Load gateway drain-time busy-input behavior from config/env."""
+        """Load gateway drain-time busy-input behavior from config/env.
+
+        LOCAL PATCH: unset OR unrecognized resolves to "steer" rather than
+        upstream's "interrupt". This loader reads the RAW config.yaml, so it
+        never sees hermes_cli.config.DEFAULT_CONFIG — a profile that omits
+        display.busy_input_mode would otherwise silently interrupt here even
+        though the CLI default says steer. Explicit "interrupt" still wins.
+        """
         mode = os.getenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "").strip().lower()
         if not mode:
             cfg = _load_gateway_runtime_config()
             mode = str(cfg_get(cfg, "display", "busy_input_mode", default="") or "").strip().lower()
         if mode == "queue":
             return "queue"
-        if mode == "steer":
-            return "steer"
-        return "interrupt"
+        if mode == "interrupt":
+            return "interrupt"
+        return "steer"
 
     @staticmethod
     def _load_busy_text_mode() -> str:

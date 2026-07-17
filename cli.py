@@ -460,7 +460,9 @@ def load_cli_config() -> Dict[str, Any]:
             "show_reasoning": True,
             "reasoning_full": False,
             "streaming": True,
-            "busy_input_mode": "interrupt",
+            # LOCAL PATCH: never interrupt by default (upstream: "interrupt").
+            # Mirrors hermes_cli/config.py DEFAULT_CONFIG.
+            "busy_input_mode": "steer",
             "persistent_output": True,
             "persistent_output_max_lines": 200,
             # Print a one-line summary of resolved modal prompts (approval /
@@ -3726,13 +3728,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # busy_input_mode: "interrupt" (Enter interrupts current run),
         # "queue" (Enter queues for next turn), or "steer" (Enter injects
         # mid-run via /steer, arriving after the next tool call).
-        _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "interrupt")).strip().lower()
+        # LOCAL PATCH: unset OR unrecognized resolves to "steer", not
+        # "interrupt" (upstream). A typo'd value must not silently start
+        # interrupting turns. Explicit "interrupt" is still honored.
+        _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "steer")).strip().lower()
         if _bim == "queue":
             self.busy_input_mode = "queue"
-        elif _bim == "steer":
-            self.busy_input_mode = "steer"
-        else:
+        elif _bim == "interrupt":
             self.busy_input_mode = "interrupt"
+        else:
+            self.busy_input_mode = "steer"
 
         # self.verbose ONLY controls global DEBUG logging (root logger level).
         # display.tool_progress="verbose" controls tool-call rendering (full args,
