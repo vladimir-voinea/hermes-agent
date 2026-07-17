@@ -1610,15 +1610,31 @@ DEFAULT_CONFIG = {
         # (Holo) that returns element locations/coordinates + layout/state,
         # rather than general image description. Treated as a first-class
         # vision task by the router (see auxiliary_client._is_vision_task), so
-        # it gets the same vision-client handling as `vision`. Default endpoint
-        # is the home cluster's Holo-4B on gpu1 (no-think :8081 — grounding
-        # wants deterministic coordinates, not chain-of-thought); flip base_url
-        # to :8080 for the thinking variant or to the dgx2 35B for harder UI
-        # reasoning.
+        # it gets the same vision-client handling as `vision`.
+        #
+        # Unconfigured by default, like its `vision`/`web_extract` siblings:
+        # grounding needs a *specialist* model and there is no endpoint that is
+        # a sane universal default. Point it at your own server in config.yaml:
+        #
+        #     auxiliary:
+        #       inspect_ui:
+        #         provider: custom
+        #         model: holo-4b
+        #         base_url: http://<your-holo-host>:8081/v1
+        #
+        # Prefer a no-think endpoint — grounding wants deterministic
+        # coordinates, not chain-of-thought — and a larger model (e.g. Holo
+        # 35B) for harder UI reasoning.
+        #
+        # Leaving both `model` and `base_url` empty does NOT quietly fall back
+        # to the general `vision` model: inspect_ui refuses instead (see
+        # tools/vision_tools._handle_inspect_ui). A general vision model will
+        # happily return confident, ungrounded coordinates, and a wrong click
+        # is worse than a clear error.
         "inspect_ui": {
-            "provider": "custom",
-            "model": "holo-4b",
-            "base_url": "http://192.168.1.45:8081/v1",
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
             "api_key": "",
             "timeout": 120,
             "extra_body": {},

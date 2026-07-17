@@ -1596,13 +1596,34 @@ async def _handle_inspect_ui(args: Dict[str, Any], **kw: Any) -> str:
     )
 
     model = None
+    base_url = ""
     try:
         from hermes_cli.config import cfg_get, load_config
-        _m = cfg_get(load_config(), "auxiliary", "inspect_ui", "model")
+        _cfg = load_config()
+        _m = cfg_get(_cfg, "auxiliary", "inspect_ui", "model")
         if _m:
             model = str(_m).strip() or None
+        base_url = str(cfg_get(_cfg, "auxiliary", "inspect_ui", "base_url") or "").strip()
     except Exception:
         pass
+
+    # Refuse rather than answer from the general vision model. inspect_ui exists
+    # so that a grounding specialist replies even when the active model has its
+    # own vision; a general model returns confident, ungrounded coordinates, and
+    # a caller that clicks them is worse off than one handed a clear error.
+    if not model and not base_url:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "inspect_ui is not configured. Point auxiliary.inspect_ui in "
+                "config.yaml at a GUI-grounding endpoint, e.g. provider: custom, "
+                "model: holo-4b, base_url: http://<host>:8081/v1. It ships with "
+                "no default because grounding needs a specialist model, and "
+                "falling back to the general vision model would return "
+                "coordinates that look right and are not."
+            ),
+            "analysis": "",
+        }, indent=2)
 
     raw = await vision_analyze_tool(
         screenshot, prompt, model, task_id=task_id, task="inspect_ui",
