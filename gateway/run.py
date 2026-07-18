@@ -8005,7 +8005,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         event = MessageEvent(text=str(req.get("text") or ""),
                                              source=src)
-                        resp = await self._handle_message(event)
+                        # Real inbound arrives through a PER-PROFILE adapter
+                        # wrapper that stamps source.profile and wraps handling
+                        # in that profile's runtime scope (see the _handler
+                        # above at adapter registration). Mirror it, or the
+                        # session key misses the profile namespace and the
+                        # turn runs unscoped — the harness's first flight
+                        # resolved the wrong cwd for exactly this reason.
+                        prof = str(req.get("profile") or "").strip()
+                        if prof:
+                            src.profile = prof
+                            _ph = None
+                            try:
+                                from hermes_cli.profiles import get_profile_dir
+                                _ph = get_profile_dir(prof)
+                            except Exception:
+                                _ph = None
+                            if _ph is not None:
+                                with _profile_runtime_scope(Path(_ph)):
+                                    resp = await self._handle_message(event)
+                            else:
+                                resp = await self._handle_message(event)
+                        else:
+                            resp = await self._handle_message(event)
                         resp_text = getattr(resp, "text", resp)
                         f.with_suffix(".out").write_text(json.dumps(
                             {"response": resp_text if isinstance(resp_text, str)
