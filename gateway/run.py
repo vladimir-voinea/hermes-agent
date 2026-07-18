@@ -7997,7 +7997,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             platform=Platform.TELEGRAM,
                             chat_id=str(req.get("chat_id") or ""),
                             chat_name=str(req.get("chat_name") or "inject"),
-                            chat_type=str(req.get("chat_type") or "supergroup"),
+                            chat_type=str(req.get("chat_type") or "group"),
                             user_id=str(req.get("user_id") or "selftest"),
                             user_name=str(req.get("user_name") or "selftest"),
                             thread_id=(str(req["thread_id"])
