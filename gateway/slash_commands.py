@@ -1866,7 +1866,7 @@ class GatewaySlashCommandsMixin:
                                 if str(result.target_provider or "").strip().lower() != "custom":
                                     clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
                                 from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
+                                save_config(_persist_cfg, merge_existing=True)
                             except Exception as e:
                                 logger.warning("Failed to persist model switch: %s", e)
 
@@ -2131,7 +2131,7 @@ class GatewaySlashCommandsMixin:
                     if str(result.target_provider or "").strip().lower() != "custom":
                         clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
                     from hermes_cli.config import save_config
-                    save_config(cfg)
+                    save_config(cfg, merge_existing=True)
                 except Exception as e:
                     logger.warning("Failed to persist model switch: %s", e)
 

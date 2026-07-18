@@ -404,7 +404,7 @@ def _cmd_migrate(args):
     # Ensure config.yaml exists before migration tries to read it
     config_path = get_config_path()
     if not config_path.exists():
-        save_config(load_config())
+        save_config(load_config(), merge_existing=True)
 
     # Load the migration module
     try:
