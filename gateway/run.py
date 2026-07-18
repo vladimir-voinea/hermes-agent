@@ -7663,6 +7663,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
 
+        # Operator's local E2E harness: spool-file -> real inbound path.
+        asyncio.create_task(self._inject_spool_watcher())
+
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
@@ -7956,6 +7959,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(result, "success", True):
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
+
+    async def _inject_spool_watcher(self, interval: int = 2):
+        """Local E2E harness: a JSON file dropped in ~/.hermes/gateway-inject/
+        becomes an inbound message on the REAL handling path — the same
+        MessageEvent -> _handle_message the Telegram adapter drives — and the
+        reply goes out through the REAL adapter to the named chat/thread.
+
+        {"text": "/orchestrator status", "chat_id": "-100...", "thread_id":
+         "2829", "user_name": "selftest", "deliver": true}
+
+        The response is also written to <file>.out so a harness can assert on
+        it byte-for-byte. Owner-only local seam (0700 dir on the operator's
+        own machine — the same trust level as config.yaml itself). Modeled on
+        the CLI-handoff synthetic turn above; exists because "I cannot send a
+        Telegram message" was a self-imposed limit: the message IS this event.
+        """
+        spool = Path.home() / ".hermes" / "gateway-inject"
+        try:
+            spool.mkdir(mode=0o700, exist_ok=True)
+        except Exception:
+            return
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                for f in sorted(spool.glob("*.json")):
+                    try:
+                        req = json.loads(f.read_text())
+                    except Exception:
+                        try:
+                            f.rename(f.with_suffix(".bad"))
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        src = SessionSource(
+                            platform=Platform.TELEGRAM,
+                            chat_id=str(req.get("chat_id") or ""),
+                            chat_name=str(req.get("chat_name") or "inject"),
+                            chat_type=str(req.get("chat_type") or "supergroup"),
+                            user_id=str(req.get("user_id") or "selftest"),
+                            user_name=str(req.get("user_name") or "selftest"),
+                            thread_id=(str(req["thread_id"])
+                                       if req.get("thread_id") else None),
+                        )
+                        event = MessageEvent(text=str(req.get("text") or ""),
+                                             source=src)
+                        resp = await self._handle_message(event)
+                        resp_text = getattr(resp, "text", resp)
+                        f.with_suffix(".out").write_text(json.dumps(
+                            {"response": resp_text if isinstance(resp_text, str)
+                             else str(resp_text)}, indent=2))
+                        f.rename(f.with_suffix(".done"))
+                        if req.get("deliver", True) and isinstance(resp_text, str) and resp_text.strip():
+                            adapter = self.adapters.get(Platform.TELEGRAM)
+                            if adapter is not None:
+                                md = ({"thread_id": str(req["thread_id"])}
+                                      if req.get("thread_id") else None)
+                                await adapter.send(
+                                    chat_id=str(req.get("chat_id") or ""),
+                                    content=resp_text, metadata=md)
+                    except Exception as exc:
+                        try:
+                            f.with_suffix(".out").write_text(json.dumps(
+                                {"error": repr(exc)}))
+                            f.rename(f.with_suffix(".done"))
+                        except Exception:
+                            pass
+                        logger.warning("inject spool: %s failed: %s", f.name, exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("inject spool pass failed", exc_info=True)
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
