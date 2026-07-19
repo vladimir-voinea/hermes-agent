@@ -553,11 +553,7 @@ const DEFAULT_LIGHT_MODE = detectLightMode()
 export const DEFAULT_THEME: Theme =
   process.env.HERMES_TUI_VARIANT === '2'
     ? OPENCODE_THEME
-    : normalizeThemeForAnsiLightTerminal(
-        DEFAULT_LIGHT_MODE ? LIGHT_THEME : DARK_THEME,
-        process.env,
-        DEFAULT_LIGHT_MODE
-      )
+    : normalizeThemeForAnsiLightTerminal(DEFAULT_LIGHT_MODE ? LIGHT_THEME : DARK_THEME, process.env, DEFAULT_LIGHT_MODE)
 
 // ── Skin → Theme ─────────────────────────────────────────────────────
 

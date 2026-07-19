@@ -130,6 +130,7 @@ const [ink, appMod, { logFrameEvent }, { trackFrame }] = await Promise.all([
   import('./lib/perfPane.js'),
   import('./lib/fpsStore.js')
 ])
+
 const { App } = appMod
 
 // Both consumers are undefined when their env flags are off; only attach

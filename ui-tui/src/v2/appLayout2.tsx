@@ -5,12 +5,7 @@ import { Fragment, memo } from 'react'
 import type { AppLayoutProps } from '../app/interfaces.js'
 import { $overlayState } from '../app/overlayStore.js'
 import { $uiState } from '../app/uiStore.js'
-import {
-  AgentsOverlayPane,
-  ComposerPane,
-  JourneyPane,
-  PetPane
-} from '../components/appLayout.js'
+import { AgentsOverlayPane, ComposerPane, JourneyPane, PetPane } from '../components/appLayout.js'
 import { PromptZone } from '../components/appOverlays.js'
 import { StreamingAssistant } from '../components/streamingAssistant.js'
 import { INLINE_MODE } from '../config/env.js'

@@ -1,3 +1,4 @@
+import { Box, Text } from '@hermes/ink'
 /** @jsxRuntime automatic @jsxImportSource react */
 // V2Transcript — flat/borderless, opencode-style transcript renderer.
 //
@@ -10,7 +11,6 @@
 // per-role/kind rules encoded below.
 import type { ReactNode } from 'react'
 
-import { Box, Text } from '@hermes/ink'
 import type { Msg } from '../types.js'
 
 import { P } from './palette.js'
@@ -18,6 +18,7 @@ import { P } from './palette.js'
 /** First line of a (possibly multi-line) thinking blob, trimmed. */
 function firstLineOf(thinking: string): string {
   const line = thinking.split('\n')[0] ?? ''
+
   return line.trim()
 }
 
@@ -92,6 +93,7 @@ function renderDiff(msg: Msg, i: number): ReactNode {
 
 function renderTools(msg: Msg, i: number): ReactNode {
   const tools = msg.tools ?? []
+
   return tools.map((toolStr, ti) => renderToolRow(toolStr, `${i}-${ti}`, ti === 0 ? 1 : 0))
 }
 
