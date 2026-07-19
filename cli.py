@@ -6006,6 +6006,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._command_status = ""
             self._invalidate(min_interval=0.0)
 
+    def _run_shell_command(self, command: str) -> None:
+        """Run a ``!``-prefixed shell-mode line as a local shell command.
+
+        Output goes to the transcript only — nothing is sent to the model.
+        Output is captured (not a tty), so interactive/TUI programs aren't
+        supported; a 300s kill keeps a hung command from wedging the
+        input area, which is read-only while ``_command_running`` is set.
+        """
+        if not command:
+            _cprint(f"  {_DIM}Nothing to run — type a command after the !{_RST}")
+            return
+        import subprocess
+        with self._busy_command(f"$ {command}"):
+            try:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    executable=os.environ.get("SHELL") or None,
+                    text=True,
+                    errors="replace",
+                    capture_output=True,
+                    timeout=300,
+                )
+            except subprocess.TimeoutExpired:
+                _cprint(f"  {_DIM}✗ Killed after 300s timeout{_RST}")
+                return
+            except Exception as exc:
+                _cprint(f"  {_DIM}✗ {exc}{_RST}")
+                return
+        out = (result.stdout or "").rstrip("\n")
+        err = (result.stderr or "").rstrip("\n")
+        if out:
+            print(out)
+        if err:
+            print(err)
+        if result.returncode != 0:
+            _cprint(f"  {_DIM}✗ exit {result.returncode}{_RST}")
+
     def _open_external_editor(self, buffer=None) -> bool:
         """Open the active input buffer in an external editor."""
         app = getattr(self, "_app", None)
@@ -13508,6 +13546,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return _state_fragment("class:prompt-working", "⚕")
         if self._voice_mode:
             return _state_fragment("class:voice-prompt", "🎤")
+        # `!` shell mode: a leading bang runs the line as a local shell
+        # command on Enter; deleting the bang returns to chat mode.  The
+        # prompt is re-evaluated on every keystroke, so this flips live.
+        buf = getattr(self, "_tui_input_buffer", None)
+        if buf is not None and buf.text.lstrip().startswith("!"):
+            return [("class:shell-prompt", "$ ")]
         return [("class:prompt", symbol)]
 
     def _get_tui_prompt_text(self) -> str:
@@ -14022,6 +14066,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 payload = (text, images) if images else text
                 if self._agent_running and not (text and _looks_like_slash_command(text)):
                     _effective_mode = self.busy_input_mode
+                    if text.startswith("!"):
+                        # `!` shell-mode input is local — never steer/interrupt
+                        # the model with it; queue it to run after this turn.
+                        _effective_mode = "queue"
                     if _effective_mode == "steer":
                         # Route Enter through /steer — inject mid-run after the
                         # next tool call.  Images can't ride along (steer only
@@ -14770,6 +14818,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # which tries to mkdir() the mkdtemp() directory again and raises
         # EEXIST. The suffix keeps markdown highlighting without that bug.
         input_area.buffer.tempfile_suffix = '.md'
+        # Expose the buffer so the dynamic prompt can detect `!` shell mode.
+        self._tui_input_buffer = input_area.buffer
 
         # Dynamic height: accounts for both explicit newlines AND visual
         # wrapping of long lines so the input area always fits its content.
@@ -15522,6 +15572,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             'approval-cmd': '#AAAAAA italic',
             'approval-choice': '#AAAAAA',
             'approval-selected': '#FFD700 bold',
+            # `!` shell mode prompt
+            'shell-prompt': '#FF8C00 bold',
             # Voice mode
             'voice-prompt': '#87CEEB',
             'voice-recording': '#FF4444 bold',
@@ -15743,6 +15795,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         and isinstance(user_input, str)
                         and self._consume_pending_resume_selection(user_input)
                     ):
+                        continue
+
+                    # `!` shell mode: run the line as a local shell command
+                    # instead of sending it to the agent.
+                    if not _file_drop and isinstance(user_input, str) and user_input.lstrip().startswith("!"):
+                        self._run_shell_command(user_input.lstrip()[1:].strip())
                         continue
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
