@@ -78,6 +78,13 @@ import pytest
     ("x-ai/grok-4-fast-reasoning", 300.0),
     ("x-ai/grok-4.20-reasoning", 300.0),
     ("x-ai/grok-4-fast-non-reasoning", 180.0),
+    # The grok-4 flagship family reasons by DEFAULT (no non-thinking
+    # variant exists). grok-4.5 observed live thinking silently past
+    # 90s on a build request (2026-07-19); the explicit longer slugs
+    # above still win via longest-slug-first matching.
+    ("x-ai/grok-4.5", 600.0),
+    ("x-ai/grok-4", 300.0),
+    ("x-ai/grok-4-0709", 300.0),
 ])
 def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
@@ -102,10 +109,10 @@ def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
     "olmo-13b",
     "llama-4-70b-o1-preview",     # embedded `o1-preview`, NOT start of slug
     "some-model-o3-mini-fork",    # embedded `o3-mini`, NOT start of slug
-    # Bare "grok" must not over-match non-reasoning Grok SKUs.
+    # Bare "grok" must not over-match pre-reasoning / non-reasoning
+    # Grok SKUs (grok-4+ moved to the positive list — that family
+    # reasons by default).
     "x-ai/grok-3",
-    "x-ai/grok-4",
-    "x-ai/grok-4-0709",
     "x-ai/grok-code-fast-1",
     # Qwen2 must not match Qwen3 (different family).
     "qwen2-72b-instruct",

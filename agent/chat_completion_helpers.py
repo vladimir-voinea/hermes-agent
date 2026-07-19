@@ -536,6 +536,30 @@ def interruptible_api_call(agent, api_kwargs: dict):
     else:
         _codex_idle_timeout_default = 12.0
 
+    # Reasoning models legitimately emit NO SSE events during their thinking
+    # phase — the opening frame arrives, then minutes of silence before the
+    # first output token (observed live with grok-4.5 over codex_responses:
+    # the 60s idle default killed a healthy build request three times in a
+    # row). Floor the idle default with the same per-model table the
+    # non-stream stale detector uses, and with any operator-configured
+    # provider/model stale_timeout_seconds, so one config surface governs
+    # every silence detector. HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS
+    # still overrides outright below.
+    if _codex_watchdog_enabled:
+        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+        _idle_reasoning_floor = get_reasoning_stale_timeout_floor(
+            api_kwargs.get("model") or agent.model
+        )
+        if _idle_reasoning_floor:
+            _codex_idle_timeout_default = max(
+                _codex_idle_timeout_default, _idle_reasoning_floor
+            )
+        _idle_cfg_floor = get_provider_stale_timeout(agent.provider, agent.model)
+        if _idle_cfg_floor:
+            _codex_idle_timeout_default = max(
+                _codex_idle_timeout_default, _idle_cfg_floor
+            )
+
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
     # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
     # killed subscription-backed Codex requests mid-prefill before the backend

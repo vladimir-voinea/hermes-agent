@@ -602,3 +602,74 @@ def test_large_codex_request_hard_ceiling_caps_raised_stale_floor(tmp_path, monk
         assert "stale_call_kill" in closes, f"stale kill expected, got {closes}"
     finally:
         stop["flag"] = True
+
+
+def test_reasoning_model_floor_spares_thinking_silence(tmp_path, monkeypatch):
+    """A reasoning model (grok-4.5 over codex_responses, the xai-oauth shape)
+    emits an opening SSE frame and then thinks in SILENCE. The idle watchdog's
+    token-scaled default (12s at small context, 60s at >10k) killed exactly
+    this live on 2026-07-19; the per-model reasoning floor must spare it."""
+    from run_agent import AIAgent
+    from agent import chat_completion_helpers as h
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", raising=False)
+
+    agent = AIAgent(
+        model="grok-4.5",
+        provider="xai-oauth",
+        api_key="sk-dummy",
+        base_url="https://api.x.ai/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+    agent.api_mode = "codex_responses"
+    monkeypatch.setattr(agent, "_emit_status", lambda *a, **k: None)
+    monkeypatch.setattr(
+        agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 120.0
+    )
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+
+    stop = {"flag": False}
+    calls = {"n": 0}
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("connection closed")
+        # First event arrives, then 14s of pure thinking silence — longer
+        # than the old 12s small-context idle bucket, far shorter than the
+        # 600s grok-4.5 reasoning floor.
+        agent._codex_stream_last_event_ts = time.time()
+        deadline = time.time() + 14
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    try:
+        with pytest.raises(Exception) as excinfo:
+            h.interruptible_api_call(agent, {"model": "grok-4.5", "input": "hi"})
+        assert "after first byte" not in str(excinfo.value), (
+            f"idle watchdog killed a thinking reasoning model: {excinfo.value}"
+        )
+        assert "codex_stream_idle_kill" not in closes, (
+            f"idle kill fired despite the reasoning floor: {closes}"
+        )
+    finally:
+        stop["flag"] = True

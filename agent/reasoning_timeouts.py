@@ -112,6 +112,18 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("grok-4-fast-reasoning", 300),
     ("grok-4.20-reasoning", 300),
     ("grok-4-fast-non-reasoning", 180),
+    # grok-4.5 (and the bare grok-4 flagship it descends from) reasons by
+    # DEFAULT — there is no non-thinking variant. Observed live (2026-07-19):
+    # a ~13k-token build request emitted the opening SSE frame and then
+    # thought silently past every implicit threshold (60s codex idle kill,
+    # 90s non-stream stale kill) while the same request succeeded in the
+    # xAI CLI, which tolerates the silence. 600s matches the o-series /
+    # DeepSeek entries for the same multi-minute-thinking failure mode.
+    # The right-anchor treats ``.`` as a separator, so the ``grok-4``
+    # family entry also covers grok-4.5/grok-4.6…; longest-slug-first
+    # matching keeps the explicit fast/non-reasoning entries winning.
+    ("grok-4.5", 600),
+    ("grok-4", 300),
 )
 
 
