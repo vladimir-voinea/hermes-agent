@@ -40,9 +40,6 @@ logger = logging.getLogger(__name__)
 
 _VALID_MODES = frozenset({"auto", "native", "stt"})
 
-# Default caption when the user submits a voice message with no typed text.
-_DEFAULT_AUDIO_CAPTION = "Respond to the user's spoken message in the attached audio."
-
 # Voice-mode guidance — mirrors the STT-path prefix cli.py prepends when
 # self._voice_mode is active, so native-audio turns get the same concise
 # conversational style.
@@ -137,16 +134,19 @@ def build_native_audio_parts(
     """Build an OpenAI-style ``content`` list carrying a WAV recording.
 
     Shape (verified against vLLM's OpenAI-compatible endpoint):
-      [{"type": "text", "text": "...\\n\\n[Audio message attached at: /path]"},
-       {"type": "input_audio", "input_audio": {"data": "<base64 wav>",
-                                               "format": "wav"}}]
+      # voice-only (no typed text, not voice-mode) — audio ALONE, like nemo:
+      [{"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}}]
+      # with a typed caption and/or voice-mode guidance — a leading text part:
+      [{"type": "text", "text": "<voice guidance> <user caption>"},
+       {"type": "input_audio", ...}]
 
-    The text part combines the user's caption (or a neutral default when
-    the turn is voice-only), optional voice-mode style guidance matching
-    the STT-path prefix, and a path hint. The hint gives the model a
-    string handle so tools that take an audio path argument can be
-    invoked on the same recording — paralleling the ``[Image attached
-    at: <path>]`` hint from ``image_routing.build_native_content_parts``.
+    No "attached audio" caption and no ``[Audio message attached at: <path>]``
+    file hint are ever synthesized. Audio-native models just hear the clip
+    (nemo needs no caption); a file-framed text part makes agentic, text-first
+    models like gemma hunt for a path / call video_analyze instead of listening
+    (empirically verified). A text part appears only for the user's own typed
+    caption and/or voice-mode reply-style guidance (which shapes the spoken
+    reply — it does not describe the audio).
 
     Returns ``(parts, None)`` on success, ``(None, reason)`` when the WAV
     can't be read — the caller degrades to STT.
@@ -162,16 +162,27 @@ def build_native_audio_parts(
 
     b64 = base64.b64encode(raw).decode("ascii")
 
-    text = (user_text or "").strip()
-    base_text = text or _DEFAULT_AUDIO_CAPTION
+    # Do NOT synthesize an "attached audio" caption for a voice-only turn.
+    # Audio-native models just hear the clip (nemo needs no caption); a
+    # file-framed caption ("...in the attached audio") makes agentic, text-first
+    # models like gemma hunt for a path or reach for video_analyze/transcription
+    # tools instead of listening — and no path hint either (same reason; worse on
+    # transcript replay where the base64 is stripped but the note survives).
+    # Only emit a text part when there's something real to say: the user's own
+    # typed caption, and/or voice-mode reply-style guidance (which shapes the
+    # spoken reply — it does not describe the audio). A voice-only turn carries
+    # the audio part ALONE, exactly like nemo receives it.
+    lead_bits: List[str] = []
     if voice_mode:
-        base_text = f"{_VOICE_MODE_GUIDANCE} {base_text}"
-    combined_text = f"{base_text}\n\n[Audio message attached at: {wav_path}]"
+        lead_bits.append(_VOICE_MODE_GUIDANCE)
+    text = (user_text or "").strip()
+    if text:
+        lead_bits.append(text)
 
-    parts: List[Dict[str, Any]] = [
-        {"type": "text", "text": combined_text},
-        {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}},
-    ]
+    parts: List[Dict[str, Any]] = []
+    if lead_bits:
+        parts.append({"type": "text", "text": " ".join(lead_bits)})
+    parts.append({"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}})
     return parts, None
 
 
