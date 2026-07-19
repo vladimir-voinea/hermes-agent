@@ -1012,7 +1012,15 @@ class CredentialPool:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
-        if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
+        # kimi-oauth is the one OAuth provider that does NOT carry its refresh
+        # token in the pool entry: the single-use, rotating refresh token lives
+        # only in the shared Kimi CLI file (~/.kimi-code/credentials), and
+        # persisting a per-profile copy into the pool would revoke every peer on
+        # the next rotation. Its refresh reads that file directly, so an empty
+        # entry.refresh_token is expected and must NOT veto the refresh.
+        if entry.auth_type != AUTH_TYPE_OAUTH or (
+            not entry.refresh_token and self.provider != "kimi-oauth"
+        ):
             if force:
                 self._mark_exhausted(entry, None)
             return None
@@ -1117,6 +1125,28 @@ class CredentialPool:
                     force_refresh=force,
                 )
                 updated = self._sync_nous_entry_from_auth_store(entry)
+            elif self.provider == "kimi-oauth":
+                # The 900s access token and its single-use refresh token live in
+                # the shared Kimi CLI file (~/.kimi-code/credentials/
+                # kimi-code.json), not auth.json. resolve_kimi_oauth_runtime_
+                # credentials refreshes under a cross-process lock — re-reading
+                # the file first so a peer that already rotated is adopted rather
+                # than double-spent — and writes the new pair back. Kimi's
+                # expires_at is UNIX SECONDS; the pool tracks milliseconds.
+                creds = auth_mod.resolve_kimi_oauth_runtime_credentials(
+                    force_refresh=force,
+                    refresh_if_expiring=True,
+                )
+                new_token = str(creds.get("api_key") or "").strip()
+                try:
+                    new_expires_ms = int(creds["expires_at"]) * 1000
+                except (KeyError, TypeError, ValueError):
+                    new_expires_ms = entry.expires_at_ms
+                updated = replace(
+                    entry,
+                    access_token=new_token or entry.access_token,
+                    expires_at_ms=new_expires_ms,
+                )
             else:
                 return entry
         except Exception as exc:
@@ -1412,6 +1442,19 @@ class CredentialPool:
             # runtime credentials are actually resolved, not merely when the pool
             # is enumerated for listing, migration, or selection.
             return False
+        if self.provider == "kimi-oauth":
+            # Kimi Code access tokens live only ~900s. The pool seeds and
+            # refreshes but does NOT re-resolve per request, so without a
+            # proactive refresh the seeded token silently ages out and every
+            # call 401s until some other path rewrites the CLI file. Refresh
+            # once inside the CLI's own skew so a selected credential never
+            # carries an already-expired bearer.
+            if entry.expires_at_ms is None:
+                return False
+            return int(entry.expires_at_ms) <= (
+                int(time.time() * 1000)
+                + auth_mod.KIMI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS * 1000
+            )
         return False
 
     def select(self) -> Optional[PooledCredential]:

@@ -3354,3 +3354,55 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
     assert synced.last_error_reason is None
     assert synced.last_error_message is None
     assert synced.last_error_reset_at is None
+
+
+def test_kimi_oauth_pool_proactively_refreshes_expiring_token(tmp_path, monkeypatch):
+    """kimi-oauth access tokens live only ~900s and the pool does not re-resolve
+    per request, so it MUST proactively refresh an expiring entry on select() —
+    otherwise the seeded token ages out and every gateway call 401s (the Telegram
+    symptom). The single-use refresh token lives only in the shared Kimi CLI file,
+    never in the pool entry, so an empty entry.refresh_token must not veto it.
+    """
+    from dataclasses import replace
+    import hermes_cli.auth as auth_mod
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+
+    entry = PooledCredential(
+        provider="kimi-oauth",
+        id="kimi-code-cli",
+        label="kimi-code.json",
+        auth_type="oauth",
+        priority=0,
+        source="kimi-code-cli",
+        access_token="STALE-EXPIRED-TOKEN",
+        refresh_token="",                       # by design — the token is file-resident
+        expires_at_ms=int(time.time() * 1000) - 60_000,  # expired 1 min ago
+    )
+    pool = CredentialPool("kimi-oauth", [entry])
+
+    # Expiry gating: an expired entry needs refresh; a fresh one does not.
+    assert pool._entry_needs_refresh(entry) is True
+    assert pool._entry_needs_refresh(
+        replace(entry, expires_at_ms=int(time.time() * 1000) + 3_600_000)
+    ) is False
+
+    future_s = int(time.time()) + 900
+    calls = {}
+
+    def _fake_resolve(*, force_refresh=False, refresh_if_expiring=True, **kw):
+        calls["force_refresh"] = force_refresh
+        return {"api_key": "FRESH-TOKEN", "expires_at": future_s,
+                "base_url": "https://api.kimi.com/coding/v1"}
+
+    monkeypatch.setattr(
+        auth_mod, "resolve_kimi_oauth_runtime_credentials", _fake_resolve)
+
+    selected = pool.select()
+
+    assert selected is not None                      # empty refresh_token did NOT veto
+    assert calls == {"force_refresh": False}         # proactive → force=False, resolve decides
+    assert selected.access_token == "FRESH-TOKEN"    # adopted the refreshed bearer
+    assert selected.expires_at_ms == future_s * 1000  # Kimi unix-seconds → pool ms
