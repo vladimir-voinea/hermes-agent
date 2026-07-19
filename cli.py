@@ -7989,6 +7989,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             save_config_value("model.default", result.new_model)
             if result.provider_changed:
                 save_config_value("model.provider", result.target_provider)
+                # Keep model.base_url coherent with the new provider — a stale
+                # pinned URL survives the switch and routes the new provider's
+                # token at the old host on next boot (e.g. kimi-oauth k3 sent
+                # to api.x.ai). Same write/clear contract as the gateway's
+                # _persist_model_switch (#48305).
+                if result.base_url:
+                    save_config_value("model.base_url", result.base_url)
+                else:
+                    save_config_value("model.base_url", None)
             _cprint("    Saved to config.yaml (--global)")
         else:
             _cprint("    (session only — add --global to persist)")
@@ -8301,6 +8310,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             save_config_value("model.default", result.new_model)
             if result.provider_changed:
                 save_config_value("model.provider", result.target_provider)
+                # Keep model.base_url coherent with the new provider — a stale
+                # pinned URL survives the switch and routes the new provider's
+                # token at the old host on next boot (e.g. kimi-oauth k3 sent
+                # to api.x.ai). Same write/clear contract as the gateway's
+                # _persist_model_switch (#48305).
+                if result.base_url:
+                    save_config_value("model.base_url", result.base_url)
+                else:
+                    save_config_value("model.base_url", None)
             _cprint("    Saved to config.yaml")
         else:
             _cprint("    (session only — add --global to persist)")

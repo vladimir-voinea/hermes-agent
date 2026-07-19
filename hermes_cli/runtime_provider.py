@@ -22,6 +22,7 @@ from agent.secret_scope import get_secret as _get_secret
 from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
+    DEFAULT_KIMI_OAUTH_BASE_URL,
     DEFAULT_QWEN_BASE_URL,
     DEFAULT_XAI_OAUTH_BASE_URL,
     PROVIDER_REGISTRY,
@@ -425,6 +426,13 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "qwen-oauth":
         api_mode = "chat_completions"
         base_url = base_url or DEFAULT_QWEN_BASE_URL
+    elif provider == "kimi-oauth":
+        # The OAuth coding plan speaks OpenAI chat_completions at /coding/v1.
+        # Without this branch the else-side URL sniffer sees "/coding" and
+        # flips to anthropic_messages — that protocol is the sk-key
+        # kimi-coding provider's, not this one's.
+        api_mode = "chat_completions"
+        base_url = base_url or DEFAULT_KIMI_OAUTH_BASE_URL
     elif provider == "minimax-oauth":
         # MiniMax OAuth tokens are valid only against the Anthropic Messages
         # compatible endpoint. Do not honor stale model.api_mode values from a
